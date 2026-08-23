@@ -7,17 +7,11 @@ logger = init_logger(__name__)
 
 HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT = 16
 
-# Valid bot_task values for the tokenizer
-VALID_BOT_TASKS = {"auto", "image", "think", "recaption", "img_ratio", "none"}
+VALID_BOT_TASKS = {"auto", "image", "think", "recaption", "think_recaption", "img_ratio", "none"}
 
-# Valid sys_type values for system prompt selection
-VALID_SYS_TYPES = {
-    "none",           # No system prompt
-    "en_unified",     # Unified English system prompt (default for HunyuanImage-3)
-    "en_vanilla",     # Vanilla English system prompt
-    "en_recaption",   # Recaption English system prompt
-    "en_think_recaption",  # Think + recaption English system prompt
-    "auto",           # Auto-select based on bot_task
+SYSTEM_PROMPT_PRESETS = {
+    "none", "en_unified", "en_vanilla", "en_recaption",
+    "en_think_recaption", "dynamic", "auto",
 }
 
 
@@ -30,27 +24,15 @@ class HunyuanImage3SamplingParams(SamplingParams):
     guidance_scale: float = 2.5
     num_inference_steps: int = 50
 
-    # HunyuanImage-3 specific params
-    # Mode: auto, image, recaption, think, img_ratio
-    mode: str = "auto"
-
-    # Tokenizer bot_task: controls the bot response prefix in the tokenizer.
-    # Options: auto, image, think, recaption, img_ratio, none
-    # For image generation, "image" or "none" are typical choices.
-    # Default: "image" (no bot prefix added for gen_image mode)
+    # Tokenizer bot_task: controls the bot response prefix. Default "image"
+    # adds no bot prefix for gen_image mode.
     bot_task: str = "image"
 
-    # System prompt type: controls which system prompt to use.
-    # Options: none, en_unified, en_vanilla, en_recaption, en_think_recaption, auto
-    # Default: "en_unified" (matches generation_config.json)
-    sys_type: str = "en_unified"
+    # Preset name (see SYSTEM_PROMPT_PRESETS) or raw custom text.
+    system_prompt: str | None = "en_unified"
 
-    # CoT (Chain-of-Thought) related
-    enable_cot: bool = False
-    cot_mode: str = "recaption"  # recaption or think
-
-    # Image size control
-    image_size: str = "1024x1024"
+    # Pre-generated CoT text from AR stage (think/recaption output)
+    cot_text: str | None = None
 
     # Supported resolutions (height, width) - must be divisible by 16
     supported_resolutions: list[tuple[int, int]] | None = field(
@@ -83,19 +65,12 @@ class HunyuanImage3SamplingParams(SamplingParams):
                     self.width,
                     self.height,
                 )
-        # Validate bot_task and sys_type
         if self.bot_task not in VALID_BOT_TASKS:
             logger.warning(
                 f"Invalid bot_task '{self.bot_task}'. Must be one of {VALID_BOT_TASKS}. "
                 f"Defaulting to 'image'."
             )
             self.bot_task = "image"
-        if self.sys_type not in VALID_SYS_TYPES:
-            logger.warning(
-                f"Invalid sys_type '{self.sys_type}'. Must be one of {VALID_SYS_TYPES}. "
-                f"Defaulting to 'en_unified'."
-            )
-            self.sys_type = "en_unified"
         super()._adjust(server_args)
 
 

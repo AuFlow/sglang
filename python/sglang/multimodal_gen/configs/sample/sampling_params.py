@@ -110,7 +110,12 @@ class SamplingParams:
     # All fields below are copied from ForwardBatch
 
     # Image inputs
-    image_path: str | list[str] | None = None
+    # Per-request conditioning input: excluded from the dynamic-batch
+    # signature so image-conditioned requests can still group (the grouping
+    # gate is supports_batching_image_conditioning()).
+    image_path: str | list[str] | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
 
     # Video inputs (video-to-video conditioning)
     video_path: str | list[str] | None = None
@@ -360,10 +365,7 @@ class SamplingParams:
 
         self._validate()
 
-        # Allow env var to override num_inference_steps (for faster CI testing).
-        # Only applies to the base SamplingParams class — model-specific subclasses
-        # (e.g. HunyuanImage3SamplingParams with num_inference_steps=50) define their
-        # own defaults that should not be silently overridden by a global env var.
+        # Allow env var to override num_inference_steps (for faster CI testing on AMD)
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
@@ -1432,18 +1434,20 @@ class SamplingParams:
             type=str,
             help=(
                 "Tokenizer bot task (model-specific). For HunyuanImage-3: "
-                "auto, image, think, recaption, img_ratio, none. "
+                "auto, image, think, recaption, think_recaption, img_ratio, none. "
                 "Controls the bot response prefix in the tokenizer."
             ),
         )
         add_argument(
-            "--sys-type",
-            dest="sys_type",
+            "--system-prompt",
+            dest="system_prompt",
             type=str,
             help=(
-                "System prompt type (model-specific). For HunyuanImage-3: "
-                "none, en_unified, en_vanilla, en_recaption, en_think_recaption, auto. "
-                "Controls which system prompt to use."
+                "System prompt: preset name or raw custom text. "
+                "Presets: none, en_unified, en_vanilla, en_recaption, "
+                "en_think_recaption, dynamic, auto. "
+                "Any other string is used directly as the system prompt. "
+                "Default: en_unified."
             ),
         )
         return parser

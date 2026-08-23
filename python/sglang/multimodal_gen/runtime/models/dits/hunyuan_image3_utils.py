@@ -1,38 +1,16 @@
-# coding=utf-8
-# Copyright 2024 The HunYuan team.
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Custom attention metadata, 2D RoPE and image KV-cache helpers used by the
-HunyuanImage-3 model during image generation.
+"""Attention metadata and 2D RoPE helpers for HunyuanImage-3.
 
 Ported from the official HunyuanImage-3 model repository
 (`modeling_hunyuan_image_3.py`).
 """
 
-import math
-import logging
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
-from einops import rearrange, repeat
+from einops import repeat
 
 import torch
 import torch.nn.functional as F
 
-logger = logging.getLogger(__name__)
-
-
-# =============================================================
-# 1. Custom attention meta.
-# =============================================================
 
 @dataclass
 class HunYuanImageAttentionMeta:
@@ -54,38 +32,27 @@ def create_hunyuan_image_attention_meta(
     )
 
 
-# =============================================================
-# 2. RoPE helpers
-# =============================================================
-
-
-def rotate_half(x, interleaved=False):
-    if not interleaved:
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-    else:
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        return rearrange(torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2)
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
-    
     if cos.dim() == 3:
         cos = cos[0]
         sin = sin[0]
     ro_dim = cos.shape[-1] * 2
-    interleaved = False
-    cos = repeat(cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
-    sin = repeat(sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
+    cos = repeat(cos, "... d -> ... 1 (2 d)")
+    sin = repeat(sin, "... d -> ... 1 (2 d)")
     return torch.cat(
         [
-            q[..., :ro_dim] * cos + rotate_half(q[..., :ro_dim], interleaved) * sin,
+            q[..., :ro_dim] * cos + rotate_half(q[..., :ro_dim]) * sin,
             q[..., ro_dim:],
         ],
         dim=-1,
     ), torch.cat(
         [
-            k[..., :ro_dim] * cos + rotate_half(k[..., :ro_dim], interleaved) * sin,
+            k[..., :ro_dim] * cos + rotate_half(k[..., :ro_dim]) * sin,
             k[..., ro_dim:],
         ],
         dim=-1,
@@ -93,9 +60,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 
 
 class HunYuanRotary2DEmbedder:
-    """
-    A RoPE wrapper specifically designed for HunYuan-Image attention.
-    """
+    """2D RoPE wrapper for HunyuanImage-3 attention."""
 
     def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int):
         self.num_heads = num_heads
@@ -140,35 +105,26 @@ class HunYuanRotary2DEmbedder:
 
         first_step = attn_meta.first_step
         device = q.device
-        # 1. Prepare cos/sin
         cos, sin = self._prepare_cos_sin(custom_pos_emb, first_step, device)
 
-        # 2. Shape validation
         query_lens: list[int] = attn_meta.query_lens
         bs = len(query_lens)
         q_len = query_lens[0]
 
         assert hidden_states.shape[0] == bs * q_len, f"{hidden_states.shape[0]} != {bs * q_len}"
 
-        # 3. Reshape + transpose for apply_rotary_pos_emb
-        #    Assume q shape [B*L, H*D] -> [2, L, H, D] -> [2, H, L, D]
+        # [B*L, H*D] -> [B, L, H, D] for apply_rotary_pos_emb
         q = q.reshape(bs, q_len, self.num_heads, self.head_dim)
         k = k.reshape(bs, q_len, self.num_kv_heads, self.head_dim)
 
-        #print(f"before cos/std={cos.float().detach().std()} cos/mean={sin.float().detach().std()}")
         q, k = apply_rotary_pos_emb(q.to(torch.float32), k.to(torch.float32), cos, sin)
-        #print(f"after apply_rotary_pos_emb q/std={q.float().detach().std()} q/mean={q.float().detach().mean()} k/std={k.float().detach().std()} k/mean={k.float().detach().mean()}")
 
-        # 5. Restore original shape + convert to bfloat16
+        # Restore packed shape in bfloat16
         q = q.reshape(hidden_states.shape[0], self.num_heads * self.head_dim).to(torch.bfloat16)
         k = k.reshape(hidden_states.shape[0], self.num_kv_heads * self.head_dim).to(torch.bfloat16)
         hidden_states = hidden_states.reshape(hidden_states_shape)
         return q, k
 
-
-# =============================================================
-# 3. 2D RoPE construction (ported from official model repo)
-# =============================================================
 
 def _to_tuple(x, dim=2):
     if isinstance(x, int):
@@ -215,23 +171,12 @@ def build_2d_rope(
     image_infos: Optional[List[Tuple[slice, Tuple[int, int]]]] = None,
     device: Optional[torch.device] = None,
     base: int = 10000,
-    base_rescale_factor: float = 1.0,
-    return_all_pos: bool = False,
 ):
-    """Build 2D RoPE cos/sin tables.
-
-    Text positions use sequential 1D indices (y = x = index).
-    Image positions use 2D grid indices derived from the image layout.
-
-    Returns
-    -------
-    cos: torch.Tensor with shape [seq_len, n_elem]
-    sin: torch.Tensor with shape [seq_len, n_elem]
+    """Build 2D RoPE cos/sin tables ([seq_len, n_elem]); text uses 1D,
+    image positions use 2D grid indices.
     """
     assert n_elem % 4 == 0, f"n_elem must be divisible by 4, but got {n_elem}."
 
-    if base_rescale_factor != 1.0:
-        base *= base_rescale_factor ** (n_elem / (n_elem - 2))
     theta = 1.0 / (base ** (torch.arange(0, n_elem, 2, device=device).float() / n_elem))
     theta = theta.reshape(1, n_elem // 4, 2)  # [1, half_d, 2]
 
@@ -272,12 +217,9 @@ def build_2d_rope(
     y_pos = y_pos[:seq_len]
     all_pos = torch.stack((y_pos, x_pos), dim=1).unsqueeze(1).to(device)  # [seq_len, 1, 2]
 
-    idx_theta = (all_pos * theta).reshape(all_pos.shape[0], n_elem // 2).repeat(1, 1)
+    idx_theta = (all_pos * theta).reshape(all_pos.shape[0], n_elem // 2)
     cos = torch.cos(idx_theta)
     sin = torch.sin(idx_theta)
-
-    if return_all_pos:
-        return cos, sin, all_pos
     return cos, sin
 
 
@@ -287,38 +229,23 @@ def build_batch_2d_rope(
     image_infos: Optional[List[List[Tuple[slice, Tuple[int, int]]]]] = None,
     device: Optional[torch.device] = None,
     base: int = 10000,
-    base_rescale_factor: float = 1.0,
-    return_all_pos: bool = False,
 ):
     """Build batched 2D RoPE cos/sin tables."""
-    cos_list, sin_list, all_pos_list = [], [], []
+    cos_list, sin_list = [], []
     if image_infos is None:
         image_infos = [None]
-    for i, image_info in enumerate(image_infos):
-        res = build_2d_rope(
-            seq_len, n_elem, image_infos=image_info, device=device,
-            base=base, base_rescale_factor=base_rescale_factor,
-            return_all_pos=return_all_pos,
+    for image_info in image_infos:
+        cos, sin = build_2d_rope(
+            seq_len, n_elem, image_infos=image_info, device=device, base=base,
         )
-        if return_all_pos:
-            cos, sin, all_pos = res
-        else:
-            cos, sin = res
-            all_pos = None
         cos_list.append(cos)
         sin_list.append(sin)
-        all_pos_list.append(all_pos)
 
-    stacked_cos = torch.stack(cos_list, dim=0)
-    stacked_sin = torch.stack(sin_list, dim=0)
-
-    if return_all_pos:
-        return stacked_cos, stacked_sin, all_pos_list
-    return stacked_cos, stacked_sin
+    return torch.stack(cos_list, dim=0), torch.stack(sin_list, dim=0)
 
 
 class CachedRoPE:
-    """Cache for 2D RoPE cos/sin tables to avoid recomputation across diffusion steps."""
+    """Caches 2D RoPE cos/sin tables across diffusion steps."""
 
     def __init__(self, rope_theta: float, head_dim: int, rope_type: str = "2d"):
         self.rope_theta = rope_theta
@@ -329,7 +256,7 @@ class CachedRoPE:
         self.seq_len = None
         self.rope_image_info = None
 
-    def __call__(self, seq_len, device, rope_image_info=None, position_ids=None):
+    def __call__(self, seq_len, device, rope_image_info=None):
         if (self.seq_len != seq_len) or (rope_image_info is not None and self.rope_image_info != rope_image_info):
             if self.rope_type in ["2d", "default"]:
                 self.cos_cache, self.sin_cache = build_batch_2d_rope(
@@ -344,39 +271,8 @@ class CachedRoPE:
             self.seq_len = seq_len
             self.rope_image_info = rope_image_info
 
-        if position_ids is None:
-            cos, sin = self.cos_cache, self.sin_cache
-        else:
-            assert position_ids.dim() == 2, f"{position_ids.shape=}"
-            head_size = self.cos_cache.size(-1)
-            cos = torch.gather(self.cos_cache, dim=1, index=position_ids.unsqueeze(-1).expand(-1, -1, head_size))
-            sin = torch.gather(self.sin_cache, dim=1, index=position_ids.unsqueeze(-1).expand(-1, -1, head_size))
+        return self.cos_cache, self.sin_cache
 
-        return cos, sin
-
-
-# =============================================================
-# 4. Timestep embedding helpers (ported from official model repo)
-# =============================================================
-
-def timestep_embedding(t, dim, max_period=10000):
-    """Create sinusoidal timestep embeddings."""
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(max_period)
-        * torch.arange(start=0, end=half, dtype=torch.float32)
-        / half
-    ).to(device=t.device)
-    args = t[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    return embedding
-
-
-# =============================================================
-# 5. Custom attention impl (KV cache for image tokens).
-# =============================================================
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
@@ -388,117 +284,13 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-# ------------------------------------------------------------------
-# Attention internals logging.
-#
-# Logs input/output of EVERY call inside the attention forward pass
-# so we can compare step-by-step with vllm-omni and find the FIRST
-# line where the two frameworks diverge.
-# ------------------------------------------------------------------
-
-def _attention_forward(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor,
-    layer_id: int = -1,
-) -> torch.Tensor:
-    """Attention forward with step-by-step internals logging.
-
-    All tensors in **BNSD** layout ``[batch, heads, seq_len, head_dim]``.
-    ``attention_mask`` is a 4-D bool tensor ``[B, 1, Q, K]``
-    (True = attend, False = mask out).
-    """
-    scale = 1.0 / (query.shape[-1] ** 0.5)
-
-    # --- Optimized SDPA (the actual computation) ---
-    output = F.scaled_dot_product_attention(
-        query, key, value,
-        attn_mask=attention_mask,
-        dropout_p=0.0,
-        is_causal=False,
-        scale=scale,
-    )
-
-    return output
-
-
 class ImageKVCacheManager:
+    """Full attention over the text+image sequence (no KV caching); packed
+    ``[tokens, heads, dim]`` inputs, 4-D bool mask.
     """
-    Manages specialized caching and updating of KV-Cache for image tokens.
-    """
 
-    def __init__(self, image_token_len: int = 4097):
-        self.image_token_len: int = image_token_len
-        self.image_kv_cache_map: tuple[torch.Tensor, torch.Tensor] | None = None
-
-    def _save_image_kv_caches(self, key, value, seq_len):
-        bs, q_len, num_kv_heads, head_dim = key.shape
-        assert q_len == seq_len
-
-        key = key.reshape(-1, num_kv_heads, head_dim)
-        value = value.reshape(-1, num_kv_heads, head_dim)
-
-        cached_prompt_len = seq_len - self.image_token_len - 1
-        cached_key = [key[:cached_prompt_len], key[seq_len - 1 : seq_len]]
-        cached_value = [value[:cached_prompt_len], value[seq_len - 1 : seq_len]]
-
-        if bs > 1:
-            assert bs == 2
-            cached_key.append(key[seq_len : seq_len + cached_prompt_len])
-            cached_key.append(key[-1:])
-            cached_value.append(value[seq_len : seq_len + cached_prompt_len])
-            cached_value.append(value[-1:])
-
-        cached_key = torch.cat(cached_key, dim=0)
-        cached_value = torch.cat(cached_value, dim=0)
-        self.image_kv_cache_map = (cached_key, cached_value)
-
-    def _update_image_kv_caches(self, key, value, seq_len):
-        cached_key, cached_value = self.image_kv_cache_map
-        bs, q_len, num_kv_heads, head_dim = key.shape
-
-        cached_prompt_len = cached_key.shape[0] // bs - 1
-        assert (cached_prompt_len + 1) == (seq_len - q_len)
-
-        key = key.reshape(-1, num_kv_heads, head_dim)
-        value = value.reshape(-1, num_kv_heads, head_dim)
-
-        new_key = [
-            cached_key[:cached_prompt_len],
-            key[:q_len],
-            cached_key[cached_prompt_len : cached_prompt_len + 1],
-        ]
-        new_value = [
-            cached_value[:cached_prompt_len],
-            value[:q_len],
-            cached_value[cached_prompt_len : cached_prompt_len + 1],
-        ]
-
-        if bs > 1:
-            assert bs == 2
-            new_key.append(
-                cached_key[cached_prompt_len + 1 : cached_prompt_len + 1 + cached_prompt_len]
-            )
-            new_key.append(key[q_len:])
-            new_key.append(cached_key[-1:])
-            new_value.append(
-                cached_value[cached_prompt_len + 1 : cached_prompt_len + 1 + cached_prompt_len]
-            )
-            new_value.append(value[q_len:])
-            new_value.append(cached_value[-1:])
-
-        new_key = torch.cat(new_key, dim=0)
-        new_value = torch.cat(new_value, dim=0)
-        new_key = new_key.reshape(bs, seq_len, num_kv_heads, head_dim)
-        new_value = new_value.reshape(bs, seq_len, num_kv_heads, head_dim)
-
-        return new_key.contiguous(), new_value.contiguous()
-
-    def __call__(self, query, key, value, attn_metadata, attention_mask=None, layer_id=-1):
+    def __call__(self, query, key, value, attn_metadata, attention_mask=None):
         assert attn_metadata is not None
-        self.image_token_len = attn_metadata.num_image_tokens
-        first_step = attn_metadata.first_step
 
         total_tokens = query.shape[0]
         bs = len(attn_metadata.query_lens)
@@ -513,7 +305,6 @@ class ImageKVCacheManager:
         key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
         value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
 
-        # Full attention every step – no KV cache needed.
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
@@ -521,8 +312,13 @@ class ImageKVCacheManager:
         key = repeat_kv(key, repeat_num)
         value = repeat_kv(value, repeat_num)
 
-        attention_mask = attention_mask.contiguous()
-        attn_output = _attention_forward(query, key, value, attention_mask, layer_id=layer_id)
+        attn_output = F.scaled_dot_product_attention(
+            query, key, value,
+            attn_mask=attention_mask.contiguous(),
+            dropout_p=0.0,
+            is_causal=False,
+            scale=1.0 / (query.shape[-1] ** 0.5),
+        )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(total_tokens, head_num_per_rank, head_dim)
