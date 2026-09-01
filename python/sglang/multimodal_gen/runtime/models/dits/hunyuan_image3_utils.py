@@ -272,50 +272,28 @@ class CachedRoPE:
         return self.cos_cache, self.sin_cache
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+def image_attention(query, key, value, attn_metadata, attention_mask):
+    """Masked full-sequence attention for the diffusion loop (no KV cache).
 
-
-class ImageKVCacheManager:
-    """Full attention over the text+image sequence (no KV caching); packed
-    ``[tokens, heads, dim]`` inputs, 4-D bool mask.
+    Packed ``[tokens, heads, dim]`` inputs, 4-D bool mask. GQA KV heads are
+    broadcast natively by SDPA (``enable_gqa``) instead of materializing
+    repeated KV heads.
     """
+    total_tokens = query.shape[0]
+    bs = len(attn_metadata.query_lens)
+    q_len = total_tokens // bs
+    head_num_per_rank = query.shape[1]
+    kv_head_num_per_rank = key.shape[1]
+    head_dim = query.shape[2]
 
-    def __call__(self, query, key, value, attn_metadata, attention_mask=None):
-        total_tokens = query.shape[0]
-        bs = len(attn_metadata.query_lens)
-        q_len = total_tokens // bs
+    query = query.reshape(bs, q_len, head_num_per_rank, head_dim).transpose(1, 2).contiguous()
+    key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim).transpose(1, 2).contiguous()
+    value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim).transpose(1, 2).contiguous()
 
-        head_num_per_rank = query.shape[1]
-        kv_head_num_per_rank = key.shape[1]
-        repeat_num = head_num_per_rank // kv_head_num_per_rank
-        head_dim = query.shape[2]
-
-        query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
-        key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
-        value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
-
-        query = query.transpose(1, 2).contiguous()
-        key = key.transpose(1, 2).contiguous()
-        value = value.transpose(1, 2).contiguous()
-
-        key = repeat_kv(key, repeat_num)
-        value = repeat_kv(value, repeat_num)
-
-        attn_output = F.scaled_dot_product_attention(
-            query, key, value,
-            attn_mask=attention_mask.contiguous(),
-            dropout_p=0.0,
-            is_causal=False,
-            scale=1.0 / (query.shape[-1] ** 0.5),
-        )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(total_tokens, head_num_per_rank, head_dim)
-        return attn_output
+    attn_output = F.scaled_dot_product_attention(
+        query, key, value,
+        attn_mask=attention_mask,
+        enable_gqa=True,
+        scale=head_dim ** -0.5,
+    )
+    return attn_output.transpose(1, 2).reshape(total_tokens, head_num_per_rank, head_dim)

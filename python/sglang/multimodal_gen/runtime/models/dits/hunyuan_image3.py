@@ -43,8 +43,8 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import HunyuanImag
 from .hunyuan_image3_utils import (
     CachedRoPE,
     HunYuanRotary2DEmbedder,
-    ImageKVCacheManager,
     create_hunyuan_image_attention_meta,
+    image_attention,
 )
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -258,7 +258,6 @@ class HunYuanAttention1(nn.Module):
             causal=True,
         )
 
-        self.image_attn = ImageKVCacheManager()
         self.image_rope2d_emb = HunYuanRotary2DEmbedder(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -338,7 +337,7 @@ class HunYuanAttention1(nn.Module):
                 )[0]
 
         if attn_meta is not None:
-            attn_output = self.image_attn(q, k, v, attn_meta, attention_mask=attention_mask)
+            attn_output = image_attention(q, k, v, attn_meta, attention_mask)
         else:
             q = q.view(-1, self.num_heads, self.head_dim)
             k = k.view(-1, self.num_kv_heads, self.head_dim)
