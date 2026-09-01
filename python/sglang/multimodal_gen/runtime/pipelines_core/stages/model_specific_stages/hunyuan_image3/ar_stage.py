@@ -707,12 +707,8 @@ class HunyuanImage3AR(PipelineStage):
         gen_config = self._generation_config()
         tokenizer_kwargs: dict[str, Any] = dict(
             batch_prompt=[req.prompt for req in reqs],
-            mode="gen_image",
-            bot_task=tokenizer_bot_task,
             sequence_template=gen_config.get("sequence_template", "pretrain"),
-            drop_think=gen_config.get("drop_think", False),
             cfg_factor=cfg_factor,
-            image_base_size=self._processor.vae_reso_group.base_size,
         )
         resolved_prompt = resolve_system_prompt(
             reqs[0].system_prompt, bot_task=tokenizer_bot_task
