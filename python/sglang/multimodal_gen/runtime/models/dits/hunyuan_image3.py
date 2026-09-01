@@ -9,7 +9,6 @@ import types
 from typing import Iterable, Optional, Tuple
 
 import torch
-from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.resnet import ResnetBlock2D
 from einops import rearrange
 from torch import nn
@@ -32,6 +31,7 @@ from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.visual_embedding import TimestepEmbedder
 
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -60,7 +60,7 @@ UNEXPECTED_KEYWORDS = [
 ]
 
 # Official diffusion-I/O checkpoint key fragments mapped onto the diffusers
-# building-block attribute names they run on (see _ResBlock/TimestepEmbedder below).
+# building-block attribute names they run on (see UNetDown/UNetUp below).
 _DIFFUSION_IO_KEY_MAP = [
     ("in_layers.0.", "norm1."),
     ("in_layers.2.", "conv1."),
@@ -68,73 +68,17 @@ _DIFFUSION_IO_KEY_MAP = [
     ("out_layers.0.", "norm2."),
     ("out_layers.3.", "conv2."),
     ("skip_connection.", "conv_shortcut."),
-    ("mlp.0.", "mlp.linear_1."),
-    ("mlp.2.", "mlp.linear_2."),
+    ("mlp.0.", "mlp.fc_in."),
+    ("mlp.2.", "mlp.fc_out."),
 ]
 
 
-def _get_layer_value(config: PretrainedConfig, field: str, layer_id: int, default=None):
-    value = getattr(config, field, default)
-    if isinstance(value, list):
-        assert layer_id >= 0 and len(value) > layer_id, f"{field}[{layer_id}] missing"
-        return value[layer_id]
-    return value
-
-
-# Diffusion I/O (patch embed / final layer / timestep embedding), built on
-# diffusers building blocks; checkpoint keys are remapped in load_weights.
-
-# nn.GroupNorm default (official repo); diffusers defaults to 1e-6.
-_NORM_EPS = 1e-5
-
-
-def _normalization(channels):
-    return nn.GroupNorm(32, channels)
-
-
-class _ResBlock(ResnetBlock2D):
-    """Official ``_ResBlock`` on diffusers' ``ResnetBlock2D``: scale-shift
-    time conditioning, SiLU, 32-group norm, nearest/avg-pool up/down."""
-
-    def __init__(
-        self, in_channels, emb_channels, out_channels=None, dropout=0.0,
-        up=False, down=False,
-    ):
-        super().__init__(
-            in_channels=in_channels,
-            out_channels=out_channels or in_channels,
-            dropout=dropout,
-            temb_channels=emb_channels,
-            eps=_NORM_EPS,
-            non_linearity="swish",
-            time_embedding_norm="scale_shift",
-            kernel="sde_vp",
-            up=up,
-            down=down,
-        )
-
-
-class TimestepEmbedder(nn.Module):
-    """Embeds scalar timesteps into vector representations (GELU MLP over the
-    official sinusoidal projection: cos/sin order, no freq downscale shift)."""
-
-    def __init__(self, hidden_size, frequency_embedding_size=256, out_size=None):
-        super().__init__()
-        self.time_proj = Timesteps(
-            num_channels=frequency_embedding_size,
-            flip_sin_to_cos=True,
-            downscale_freq_shift=0,
-        )
-        self.mlp = TimestepEmbedding(
-            in_channels=frequency_embedding_size,
-            time_embed_dim=hidden_size,
-            act_fn="gelu",
-            out_dim=out_size,
-        )
-
-    def forward(self, t):
-        t_freq = self.time_proj(t).to(self.mlp.linear_1.weight.dtype)
-        return self.mlp(t_freq)
+_RES_BLOCK_KWARGS = dict(
+    eps=1e-5,
+    non_linearity="swish",
+    time_embedding_norm="scale_shift",
+    kernel="sde_vp",
+)
 
 
 class UNetDown(nn.Module):
@@ -144,28 +88,33 @@ class UNetDown(nn.Module):
                  out_channels, dropout=0.0):
         super().__init__()
         self.patch_size = patch_size
-        assert self.patch_size in [1, 2, 4, 8]
 
         self.model = nn.ModuleList([
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)
         ])
         if self.patch_size == 1:
-            self.model.append(_ResBlock(
-                in_channels=hidden_channels, emb_channels=emb_channels,
-                out_channels=out_channels, dropout=dropout,
+            self.model.append(ResnetBlock2D(
+                in_channels=hidden_channels,
+                out_channels=out_channels,
+                dropout=dropout,
+                temb_channels=emb_channels,
+                **_RES_BLOCK_KWARGS,
             ))
         else:
             for i in range(self.patch_size // 2):
-                self.model.append(_ResBlock(
-                    in_channels=hidden_channels, emb_channels=emb_channels,
+                self.model.append(ResnetBlock2D(
+                    in_channels=hidden_channels,
                     out_channels=(hidden_channels if (i + 1) * 2 != self.patch_size else out_channels),
-                    dropout=dropout, down=True,
+                    dropout=dropout,
+                    temb_channels=emb_channels,
+                    down=True,
+                    **_RES_BLOCK_KWARGS,
                 ))
 
     def forward(self, x, t):
         assert x.shape[2] % self.patch_size == 0 and x.shape[3] % self.patch_size == 0
         for module in self.model:
-            if isinstance(module, _ResBlock):
+            if isinstance(module, ResnetBlock2D):
                 x = module(x, t)
             else:
                 x = module(x)
@@ -181,25 +130,30 @@ class UNetUp(nn.Module):
                  out_channels, dropout=0.0, out_norm=False):
         super().__init__()
         self.patch_size = patch_size
-        assert self.patch_size in [1, 2, 4, 8]
         self.model = nn.ModuleList()
 
         if self.patch_size == 1:
-            self.model.append(_ResBlock(
-                in_channels=in_channels, emb_channels=emb_channels,
-                out_channels=hidden_channels, dropout=dropout,
+            self.model.append(ResnetBlock2D(
+                in_channels=in_channels,
+                out_channels=hidden_channels,
+                dropout=dropout,
+                temb_channels=emb_channels,
+                **_RES_BLOCK_KWARGS,
             ))
         else:
             for i in range(self.patch_size // 2):
-                self.model.append(_ResBlock(
+                self.model.append(ResnetBlock2D(
                     in_channels=in_channels if i == 0 else hidden_channels,
-                    emb_channels=emb_channels, out_channels=hidden_channels,
-                    dropout=dropout, up=True,
+                    out_channels=hidden_channels,
+                    dropout=dropout,
+                    temb_channels=emb_channels,
+                    up=True,
+                    **_RES_BLOCK_KWARGS,
                 ))
 
         if out_norm:
             self.model.append(nn.Sequential(
-                _normalization(hidden_channels),
+                nn.GroupNorm(32, hidden_channels),
                 nn.SiLU(),
                 nn.Conv2d(hidden_channels, out_channels, kernel_size=3, padding=1),
             ))
@@ -210,19 +164,11 @@ class UNetUp(nn.Module):
     def forward(self, x, t, token_h, token_w):
         x = rearrange(x, "b (h w) c -> b c h w", h=token_h, w=token_w)
         for module in self.model:
-            if isinstance(module, _ResBlock):
+            if isinstance(module, ResnetBlock2D):
                 x = module(x, t)
             else:
                 x = module(x)
         return x
-
-
-def _get_head_dim(config: PretrainedConfig, hidden_size: int, num_heads: int) -> int:
-    if getattr(config, "head_dim", None):
-        return config.head_dim
-    if hasattr(config, "attention_head_dim"):
-        return config.attention_head_dim
-    return hidden_size // num_heads
 
 
 def _make_rope(config: PretrainedConfig, head_dim: int, rope_theta, rope_scaling, max_position):
@@ -271,7 +217,7 @@ class HunYuanAttention1(nn.Module):
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
 
-        self.head_dim = _get_head_dim(config, hidden_size, self.total_num_heads)
+        self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -335,7 +281,6 @@ class HunYuanAttention1(nn.Module):
     ):
         """Apply the 2D image RoPE (diffusion path) or the 1D text RoPE."""
         if attn_meta is not None:
-            assert positions is None
             return self.image_rope2d_emb(q, k, hidden_states, custom_pos_emb, attn_meta)
         return self.rotary_emb(positions, q, k)
 
@@ -354,7 +299,6 @@ class HunYuanAttention1(nn.Module):
 
         if self.is_cross_attention:
             # CLA follower: attend to the master layer's K/V.
-            assert kv_states is not None
             ori_k, v = kv_states
             k = ori_k
             q, _ = self.q_proj(hidden_states)
@@ -413,10 +357,13 @@ class HunyuanImage3DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
     ) -> None:
         super().__init__()
-        assert layer_id >= 0
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
-        self.intermediate_size = _get_layer_value(config, "intermediate_size", layer_id, 0)
+        # intermediate_size may be a scalar or a per-layer list in the config
+        intermediate_size = getattr(config, "intermediate_size", 0)
+        if isinstance(intermediate_size, list):
+            intermediate_size = intermediate_size[layer_id]
+        self.intermediate_size = intermediate_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(config, "original_max_position_embeddings", None):
@@ -540,7 +487,6 @@ class HunyuanImage3Model(nn.Module):
         residual=None,
     ):
         if attn_meta is None:
-            assert num_image_tokens is not None
             attn_meta = create_hunyuan_image_attention_meta(
                 attention_mask, num_image_tokens, first_step
             )
@@ -564,7 +510,7 @@ class HunyuanImage3Model(nn.Module):
         num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         num_key_value_groups = num_attention_heads // num_kv_heads
         hidden_size = self.config.hidden_size
-        attention_head_dim = _get_head_dim(self.config, self.config.hidden_size, num_attention_heads)
+        attention_head_dim = hidden_size // num_attention_heads
 
         qkv = qkv.reshape(num_kv_heads, num_key_value_groups + 2, attention_head_dim, hidden_size)
         q, k, v = torch.split(qkv, (num_key_value_groups, 1, 1), dim=1)
@@ -617,7 +563,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             latent_channels = getattr(hf_config, "latent_channels", 32)
 
         if img_proj_type == "unet":
-            self.timestep_emb = TimestepEmbedder(hidden_size=hf_config.hidden_size)
+            self.timestep_emb = TimestepEmbedder(hidden_size=hf_config.hidden_size, act_layer="gelu")
             self.patch_embed = UNetDown(
                 patch_size=patch_size,
                 emb_channels=hf_config.hidden_size,
@@ -625,7 +571,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                 hidden_channels=patch_embed_hidden_dim,
                 out_channels=hf_config.hidden_size,
             )
-            self.time_embed = TimestepEmbedder(hidden_size=hf_config.hidden_size)
+            self.time_embed = TimestepEmbedder(hidden_size=hf_config.hidden_size, act_layer="gelu")
             self.final_layer = UNetUp(
                 patch_size=patch_size,
                 emb_channels=hf_config.hidden_size,
@@ -634,13 +580,11 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                 out_channels=latent_channels,
                 out_norm=True,
             )
-            self.time_embed_2 = TimestepEmbedder(hidden_size=hf_config.hidden_size)
+            self.time_embed_2 = TimestepEmbedder(hidden_size=hf_config.hidden_size, act_layer="gelu")
         else:
             raise ValueError(f"Unknown img_proj_type: {img_proj_type}")
 
-        head_dim = getattr(hf_config, "head_dim", None) or (
-            hf_config.hidden_size // hf_config.num_attention_heads
-        )
+        head_dim = hf_config.hidden_size // hf_config.num_attention_heads
         self.cached_rope = CachedRoPE(
             rope_theta=getattr(hf_config, "rope_theta", 10000.0),
             head_dim=head_dim,

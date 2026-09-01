@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import BaseOutput
@@ -20,69 +21,6 @@ from torch import Tensor, nn
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-
-class DiagonalGaussianDistribution:
-    def __init__(self, parameters: torch.Tensor, deterministic: bool = False):
-        if parameters.ndim == 3:
-            dim = 2  # (B, L, C)
-        elif parameters.ndim == 5 or parameters.ndim == 4:
-            dim = 1  # (B, C, T, H, W) / (B, C, H, W)
-        else:
-            raise NotImplementedError
-        self.parameters = parameters
-        self.mean, self.logvar = torch.chunk(parameters, 2, dim=dim)
-        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
-        self.deterministic = deterministic
-        self.std = torch.exp(0.5 * self.logvar)
-        self.var = torch.exp(self.logvar)
-        if self.deterministic:
-            self.var = self.std = torch.zeros_like(
-                self.mean, device=self.parameters.device, dtype=self.parameters.dtype
-            )
-
-    def sample(self, generator: Optional[torch.Generator] = None) -> torch.FloatTensor:
-        from diffusers.utils.torch_utils import randn_tensor
-        sample = randn_tensor(
-            self.mean.shape,
-            generator=generator,
-            device=self.parameters.device,
-            dtype=self.parameters.dtype,
-        )
-        x = self.mean + self.std * sample
-        return x
-
-    def kl(self, other: "DiagonalGaussianDistribution" = None) -> torch.Tensor:
-        if self.deterministic:
-            return torch.Tensor([0.0])
-        else:
-            reduce_dim = list(range(1, self.mean.ndim))
-            if other is None:
-                return 0.5 * torch.sum(
-                    torch.pow(self.mean, 2) + self.var - 1.0 - self.logvar,
-                    dim=reduce_dim,
-                )
-            else:
-                return 0.5 * torch.sum(
-                    torch.pow(self.mean - other.mean, 2) / other.var
-                    + self.var / other.var
-                    - 1.0
-                    - self.logvar
-                    + other.logvar,
-                    dim=reduce_dim,
-                )
-
-    def nll(self, sample: torch.Tensor, dims: Tuple[int, ...] = [1, 2, 3]) -> torch.Tensor:
-        if self.deterministic:
-            return torch.Tensor([0.0])
-        logtwopi = np.log(2.0 * np.pi)
-        return 0.5 * torch.sum(
-            logtwopi + self.logvar + torch.pow(sample - self.mean, 2) / self.var,
-            dim=dims,
-        )
-
-    def mode(self) -> torch.Tensor:
-        return self.mean
 
 
 @dataclass
@@ -118,7 +56,6 @@ class Conv3d(nn.Conv3d):
         memory_count = (C * T * H * W) * 2 / 1024**3
         if memory_count > 2:
             n_split = math.ceil(memory_count / 2)
-            assert n_split >= 2
             chunks = torch.chunk(input, chunks=n_split, dim=-3)
             padded_chunks = []
             for i in range(len(chunks)):
@@ -219,7 +156,6 @@ class DownsampleDCAE(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, add_temporal_downsample: bool = True):
         super().__init__()
         factor = 2 * 2 * 2 if add_temporal_downsample else 1 * 2 * 2
-        assert out_channels % factor == 0
         self.conv = Conv3d(in_channels, out_channels // factor, kernel_size=3, stride=1, padding=1)
         self.add_temporal_downsample = add_temporal_downsample
         self.group_size = factor * in_channels // out_channels
@@ -276,7 +212,6 @@ class Encoder(nn.Module):
         downsample_match_channel: bool = True,
     ):
         super().__init__()
-        assert block_out_channels[-1] % (2 * z_channels) == 0
 
         self.z_channels = z_channels
         self.block_out_channels = block_out_channels
@@ -300,7 +235,6 @@ class Encoder(nn.Module):
                 i_level >= np.log2(ffactor_spatial // ffactor_temporal)
             )
             if add_spatial_downsample or add_temporal_downsample:
-                assert i_level < len(block_out_channels) - 1
                 block_out = block_out_channels[i_level + 1] if downsample_match_channel else block_in
                 down.downsample = DownsampleDCAE(block_in, block_out, add_temporal_downsample)
                 block_in = block_out
@@ -356,7 +290,6 @@ class Decoder(nn.Module):
         upsample_match_channel: bool = True,
     ):
         super().__init__()
-        assert block_out_channels[0] % z_channels == 0
 
         self.z_channels = z_channels
         self.block_out_channels = block_out_channels
@@ -383,7 +316,6 @@ class Decoder(nn.Module):
             add_spatial_upsample = bool(i_level < np.log2(ffactor_spatial))
             add_temporal_upsample = bool(i_level < np.log2(ffactor_temporal))
             if add_spatial_upsample or add_temporal_upsample:
-                assert i_level < len(block_out_channels) - 1
                 block_out = block_out_channels[i_level + 1] if upsample_match_channel else block_in
                 up.upsample = UpsampleDCAE(block_in, block_out, add_temporal_upsample)
                 block_in = block_out
@@ -680,7 +612,6 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
         if len(x.shape) != 5:  # (B, C, T, H, W)
             x = x[:, :, None]
-        assert len(x.shape) == 5
         if x.shape[2] == 1:
             x = x.expand(-1, -1, self.ffactor_temporal, -1, -1)
         else:

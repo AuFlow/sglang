@@ -145,9 +145,7 @@ def get_meshgrid_nd(start, *args, dim=2, device="cpu"):
         start = _to_tuple(start, dim=dim)
         stop = _to_tuple(args[0], dim=dim)
         num = [stop[i] - start[i] for i in range(dim)]
-        num_int = [int(x) for x in num]
-        assert (torch.tensor(num) == torch.tensor(num_int)).all(), f"num should be int, but got {num}"
-        num = num_int
+        num = [int(x) for x in num]
     elif len(args) == 2:
         start = _to_tuple(start, dim=dim)
         stop = _to_tuple(args[0], dim=dim)
@@ -290,8 +288,6 @@ class ImageKVCacheManager:
     """
 
     def __call__(self, query, key, value, attn_metadata, attention_mask=None):
-        assert attn_metadata is not None
-
         total_tokens = query.shape[0]
         bs = len(attn_metadata.query_lens)
         q_len = total_tokens // bs
