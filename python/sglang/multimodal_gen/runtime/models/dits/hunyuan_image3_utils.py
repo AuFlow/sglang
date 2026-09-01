@@ -215,4 +215,5 @@ def image_attention(query, key, value, attention_mask):
         enable_gqa=True,
         scale=head_dim ** -0.5,
     )
-    return attn_output.transpose(1, 2).reshape(total_tokens, head_num_per_rank, head_dim)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output.reshape(total_tokens, head_num_per_rank, head_dim)

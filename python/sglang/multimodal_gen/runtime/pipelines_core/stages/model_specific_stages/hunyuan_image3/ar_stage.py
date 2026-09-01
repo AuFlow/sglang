@@ -62,8 +62,8 @@ def _cond_image_to_pil(raw_img):
         return None
 
 
-def _vae_downsample_factors(hf_config: Any) -> tuple[int, int]:
-    vae_factor = getattr(hf_config, "vae_downsample_factor", [16, 16])
+def _vae_downsample_factors(config: Any) -> tuple[int, int]:
+    vae_factor = getattr(config, "vae_downsample_factor", [16, 16])
     if isinstance(vae_factor, (list, tuple)):
         vae_h = vae_factor[0]
         vae_w = vae_factor[1] if len(vae_factor) > 1 else vae_factor[0]
@@ -326,7 +326,7 @@ class HunyuanImage3AR(PipelineStage):
         pil_image = pil_image.convert("RGB")
         orig_width, orig_height = pil_image.size
 
-        vae_h_factor, vae_w_factor = _vae_downsample_factors(self.ar_model.hf_config)
+        vae_h_factor, vae_w_factor = _vae_downsample_factors(self.ar_model.config)
 
         base_size, ratio_idx = processor.vae_reso_group.get_base_size_and_ratio_index(
             orig_width, orig_height
@@ -776,12 +776,12 @@ class HunyuanImage3AR(PipelineStage):
         return attention_mask, cos, sin
 
     def _latent_dims(self, height: int, width: int) -> tuple[int, int, int]:
-        hf_config = self.ar_model.hf_config
-        if hasattr(hf_config, "vae") and isinstance(hf_config.vae, dict):
-            latent_channels = hf_config.vae["latent_channels"]
+        arch_config = self.ar_model.config
+        if isinstance(getattr(arch_config, "vae", None), dict):
+            latent_channels = arch_config.vae["latent_channels"]
         else:
-            latent_channels = getattr(hf_config, "latent_channels", 32)
-        vae_h, vae_w = _vae_downsample_factors(hf_config)
+            latent_channels = arch_config.latent_channels
+        vae_h, vae_w = _vae_downsample_factors(arch_config)
         return latent_channels, height // vae_h, width // vae_w
 
     def _prepare_noise(

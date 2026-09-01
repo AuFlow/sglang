@@ -514,68 +514,50 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         self, config: HunyuanImage3DitConfig, prefix: str = "", **kwargs,
     ):
         super().__init__(config=config, **kwargs)
-        self.config = config
-        # self.hf_config is the full HF config dict (incl. diffusion fields);
-        # wrap it in a SimpleNamespace for attribute-style access.
-        raw_hf_config = self.hf_config
-        if isinstance(raw_hf_config, dict):
-            hf_config = types.SimpleNamespace(**raw_hf_config)
-            self.hf_config = hf_config
-        else:
-            hf_config = raw_hf_config
-        backbone_config = config.arch_config
+
+        arch_config = self.config
 
         self.model = HunyuanImage3Model(
-            backbone_config, prefix=f"{prefix}.model",
+            arch_config, prefix=f"{prefix}.model",
         )
-        self.unpadded_vocab_size = backbone_config.vocab_size
-        # No dedicated LM-head layer in multimodal_gen; this shares the
-        # vocab-parallel embedding layout and only `.weight` is consumed.
-        self.lm_head = VocabParallelEmbedding(
-            self.unpadded_vocab_size, backbone_config.hidden_size,
-            org_num_embeddings=self.unpadded_vocab_size,
-            prefix=f"{prefix}.lm_head",
-        )
-        if getattr(backbone_config, "tie_word_embeddings", False):
-            self.lm_head.weight = self.model.embed_tokens.weight
 
         # ---- Diffusion I/O modules ----
-        patch_size = getattr(hf_config, "patch_size", 1)
-        patch_embed_hidden_dim = getattr(hf_config, "patch_embed_hidden_dim", 1024)
-        img_proj_type = getattr(hf_config, "img_proj_type", "unet")
-        # latent_channels may be top-level or nested under hf_config.vae
-        if hasattr(hf_config, "vae") and isinstance(hf_config.vae, dict):
-            latent_channels = hf_config.vae["latent_channels"]
+        patch_size = getattr(arch_config, "patch_size", 1)
+        patch_embed_hidden_dim = getattr(arch_config, "patch_embed_hidden_dim", 1024)
+        img_proj_type = getattr(arch_config, "img_proj_type", "unet")
+        # latent_channels may be top-level or nested under arch_config.vae
+        if isinstance(getattr(arch_config, "vae", None), dict):
+            latent_channels = arch_config.vae["latent_channels"]
         else:
-            latent_channels = getattr(hf_config, "latent_channels", 32)
+            latent_channels = arch_config.latent_channels
 
         if img_proj_type == "unet":
-            self.timestep_emb = TimestepEmbedder(hidden_size=hf_config.hidden_size, act_layer="gelu")
+            self.timestep_emb = TimestepEmbedder(hidden_size=arch_config.hidden_size, act_layer="gelu")
             self.patch_embed = UNetDown(
                 patch_size=patch_size,
-                emb_channels=hf_config.hidden_size,
+                emb_channels=arch_config.hidden_size,
                 in_channels=latent_channels,
                 hidden_channels=patch_embed_hidden_dim,
-                out_channels=hf_config.hidden_size,
+                out_channels=arch_config.hidden_size,
             )
-            self.time_embed = TimestepEmbedder(hidden_size=hf_config.hidden_size, act_layer="gelu")
+            self.time_embed = TimestepEmbedder(hidden_size=arch_config.hidden_size, act_layer="gelu")
             self.final_layer = UNetUp(
                 patch_size=patch_size,
-                emb_channels=hf_config.hidden_size,
-                in_channels=hf_config.hidden_size,
+                emb_channels=arch_config.hidden_size,
+                in_channels=arch_config.hidden_size,
                 hidden_channels=patch_embed_hidden_dim,
                 out_channels=latent_channels,
                 out_norm=True,
             )
-            self.time_embed_2 = TimestepEmbedder(hidden_size=hf_config.hidden_size, act_layer="gelu")
+            self.time_embed_2 = TimestepEmbedder(hidden_size=arch_config.hidden_size, act_layer="gelu")
         else:
             raise ValueError(f"Unknown img_proj_type: {img_proj_type}")
 
-        head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+        head_dim = arch_config.hidden_size // arch_config.num_attention_heads
         self.cached_rope = CachedRoPE(
-            rope_theta=getattr(hf_config, "rope_theta", 10000.0),
+            rope_theta=arch_config.rope_theta,
             head_dim=head_dim,
-            rope_type=getattr(hf_config, "rope_type", "2d"),
+            rope_type=getattr(arch_config, "rope_type", "2d"),
         )
 
     def forward(self, hidden_states, timestep=None, encoder_hidden_states=None, **kwargs):
@@ -643,9 +625,9 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-        num_attention_heads = self.hf_config.num_attention_heads
+        num_attention_heads = self.config.num_attention_heads
         num_kv_heads = getattr(
-            self.hf_config, "num_key_value_heads", self.hf_config.num_attention_heads
+            self.config, "num_key_value_heads", self.config.num_attention_heads
         )
         split_params_mapping = [
             (".gate_up_proj", ".gate_and_up_proj", 2, [(1, 1), (0, 1)], None),
@@ -657,7 +639,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             ),
         ]
 
-        cla_factor = _get_cla_factor(self.hf_config)
+        cla_factor = _get_cla_factor(self.config)
 
         # Expert mapping for FusedMoE loading (matching vllm-omni); remaps
         # to fused gate_and_up_proj checkpoint keys.
@@ -666,12 +648,12 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             "up_proj": ("gate_and_up_proj", 0, 2),
         }
         expert_params_mapping = []
-        if _is_moe(self.hf_config):
+        if _is_moe(self.config):
             expert_params_mapping = FusedMoE.make_expert_params_mapping(
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
-                num_experts=self.hf_config.num_experts,
+                num_experts=self.config.num_experts,
             )
 
         params_dict = dict(self.named_parameters())
@@ -703,8 +685,6 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             if "up_proj_bias" in name:
                 name = name.replace("up_proj_bias", "up_proj.bias")
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-            if getattr(self.hf_config, "tie_word_embeddings", False) and "lm_head.weight" in name:
                 continue
 
             if name.endswith("wte.weight"):
@@ -769,7 +749,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             is_expert_weight = False
             is_found = False
             found_num = 0
-            if _is_moe(self.hf_config) and "mlp.experts" in name:
+            if _is_moe(self.config) and "mlp.experts" in name:
                 if not getattr(self, "_expert_ckpt_logged", False):
                     logger.info("  expert ckpt key sample: %s", name)
                     self._expert_ckpt_logged = True
@@ -838,7 +818,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         if missing:
             significant_missing = [
                 n for n in missing
-                if not any(k in n for k in ["rotary_emb", "lm_head"])
+                if not any(k in n for k in ["rotary_emb"])
             ]
             if significant_missing:
                 logger.warning(
