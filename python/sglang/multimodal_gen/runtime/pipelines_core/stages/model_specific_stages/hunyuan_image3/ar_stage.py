@@ -204,11 +204,9 @@ class HunyuanImage3AR(PipelineStage):
 
     def _backbone_forward(
         self,
-        num_image_tokens: int,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         custom_pos_emb: tuple[torch.Tensor, torch.Tensor],
-        first_step: bool,
         timestep: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
@@ -231,8 +229,6 @@ class HunyuanImage3AR(PipelineStage):
             hidden_states,
             attention_mask,
             (cos, sin),
-            num_image_tokens=num_image_tokens,
-            first_step=first_step,
             timestep=timestep,
         )
         # batch_size may differ after TP broadcast
@@ -931,7 +927,6 @@ class HunyuanImage3AR(PipelineStage):
             width, height, token_h, token_w, image_info,
             guidance_scale, num_inference_steps,
         ) = self._resolve_generation_params(reqs, per_request_raw_conds)
-        num_image_tokens = token_h * token_w
         do_cfg = guidance_scale > 1.0
         cfg_factor = 2 if do_cfg else 1
 
@@ -1045,19 +1040,19 @@ class HunyuanImage3AR(PipelineStage):
                 if do_cfg:
                     half = hidden_states.shape[0] // 2
                     out_cond = self._backbone_forward(
-                        num_image_tokens, hidden_states[:half],
-                        attention_mask[:half], (cos[:half], sin[:half]), True,
+                        hidden_states[:half],
+                        attention_mask[:half], (cos[:half], sin[:half]),
                         timestep=t_expand[:half],
                     )
                     out_uncond = self._backbone_forward(
-                        num_image_tokens, hidden_states[half:],
-                        attention_mask[half:], (cos[half:], sin[half:]), True,
+                        hidden_states[half:],
+                        attention_mask[half:], (cos[half:], sin[half:]),
                         timestep=t_expand[half:],
                     )
                     backbone_out = torch.cat([out_cond, out_uncond], dim=0)
                 else:
                     backbone_out = self._backbone_forward(
-                        num_image_tokens, hidden_states, attention_mask, (cos, sin), True,
+                        hidden_states, attention_mask, (cos, sin),
                         timestep=t_expand,
                     )
 

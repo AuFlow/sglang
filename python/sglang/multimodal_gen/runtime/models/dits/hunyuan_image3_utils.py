@@ -4,32 +4,11 @@ Ported from the official HunyuanImage-3 model repository
 (`modeling_hunyuan_image_3.py`).
 """
 
-from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from einops import repeat
 
 import torch
 import torch.nn.functional as F
-
-
-@dataclass
-class HunYuanImageAttentionMeta:
-    query_lens: list[int]
-    seq_lens: list[int]
-    num_image_tokens: int
-    first_step: bool
-
-
-def create_hunyuan_image_attention_meta(
-    attention_mask: torch.Tensor, num_image_tokens: int, first_step: bool
-) -> HunYuanImageAttentionMeta:
-    b, _, q_len1, seq_len = attention_mask.shape
-    return HunYuanImageAttentionMeta(
-        query_lens=[q_len1] * b,
-        seq_lens=[seq_len] * b,
-        num_image_tokens=num_image_tokens,
-        first_step=first_step,
-    )
 
 
 def rotate_half(x):
@@ -66,28 +45,6 @@ class HunYuanRotary2DEmbedder:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.custom_pos_emb: tuple[torch.Tensor, torch.Tensor] | None = None
-
-    def _prepare_cos_sin(
-        self,
-        custom_pos_emb: tuple[torch.Tensor, torch.Tensor],
-        first_step: bool,
-        device: torch.device,
-    ):
-        if first_step:
-            cos_input, sin_input = custom_pos_emb
-            cos = cos_input.to(device)
-            sin = sin_input.to(device)
-            self.custom_pos_emb = None
-        else:
-            if self.custom_pos_emb is None:
-                cos_input, sin_input = custom_pos_emb
-                cos = cos_input.to(device)
-                sin = sin_input.to(device)
-                self.custom_pos_emb = (cos, sin)
-            else:
-                cos, sin = self.custom_pos_emb
-        return cos, sin
 
     def __call__(
         self,
@@ -95,21 +52,12 @@ class HunYuanRotary2DEmbedder:
         k: torch.Tensor,
         hidden_states: torch.Tensor,
         custom_pos_emb: tuple[torch.Tensor, torch.Tensor],
-        attn_meta: HunYuanImageAttentionMeta | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_states_shape[-1])
 
-        if attn_meta is None:
-            return q, k
-
-        first_step = attn_meta.first_step
-        device = q.device
-        cos, sin = self._prepare_cos_sin(custom_pos_emb, first_step, device)
-
-        query_lens: list[int] = attn_meta.query_lens
-        bs = len(query_lens)
-        q_len = query_lens[0]
+        cos, sin = custom_pos_emb
+        bs, q_len = cos.shape[0], cos.shape[1]
 
         assert hidden_states.shape[0] == bs * q_len, f"{hidden_states.shape[0]} != {bs * q_len}"
 
@@ -124,43 +72,6 @@ class HunYuanRotary2DEmbedder:
         k = k.reshape(hidden_states.shape[0], self.num_kv_heads * self.head_dim).to(torch.bfloat16)
         hidden_states = hidden_states.reshape(hidden_states_shape)
         return q, k
-
-
-def _to_tuple(x, dim=2):
-    if isinstance(x, int):
-        return (x,) * dim
-    elif len(x) == dim:
-        return x
-    else:
-        raise ValueError(f"Expected length {dim} or int, but got {x}")
-
-
-def get_meshgrid_nd(start, *args, dim=2, device="cpu"):
-    """Get n-D meshgrid with start, stop and num."""
-    if len(args) == 0:
-        num = _to_tuple(start, dim=dim)
-        start = (0,) * dim
-        stop = num
-    elif len(args) == 1:
-        start = _to_tuple(start, dim=dim)
-        stop = _to_tuple(args[0], dim=dim)
-        num = [stop[i] - start[i] for i in range(dim)]
-        num = [int(x) for x in num]
-    elif len(args) == 2:
-        start = _to_tuple(start, dim=dim)
-        stop = _to_tuple(args[0], dim=dim)
-        num = _to_tuple(args[1], dim=dim)
-    else:
-        raise ValueError(f"len(args) should be 0, 1 or 2, but got {len(args)}")
-
-    axis_grid = []
-    for i in range(dim):
-        a, b, n = start[i], stop[i], num[i]
-        g = torch.linspace(a, b, n + 1, dtype=torch.float32, device=device)[:n]
-        axis_grid.append(g)
-    grid = torch.meshgrid(*axis_grid, indexing="ij")
-    grid = torch.stack(grid, dim=0)
-    return grid
 
 
 def build_2d_rope(
@@ -201,8 +112,17 @@ def build_2d_rope(
                 pass
             beta_y = L + (w * h - h) / 2
             beta_x = L + (w * h - w) / 2
-            grid = get_meshgrid_nd((beta_y, beta_x), (beta_y + h, beta_x + w), device=device)
-            grid = grid.reshape(2, -1)
+            # linspace(a, b, n+1)[:n] == arange(a, a+n); kept as-is for
+            # bit-parity with the official implementation
+            y_axis = torch.linspace(
+                beta_y, beta_y + h, h + 1, dtype=torch.float32, device=device
+            )[:h]
+            x_axis = torch.linspace(
+                beta_x, beta_x + w, w + 1, dtype=torch.float32, device=device
+            )[:w]
+            grid = torch.stack(
+                torch.meshgrid(y_axis, x_axis, indexing="ij"), dim=0
+            ).reshape(2, -1)
             y_sections.append(grid[0])
             x_sections.append(grid[1])
             last_pos = L + w * h
@@ -246,9 +166,12 @@ class CachedRoPE:
     """Caches 2D RoPE cos/sin tables across diffusion steps."""
 
     def __init__(self, rope_theta: float, head_dim: int, rope_type: str = "2d"):
+        # "2d" and "default" are the official spellings of the same scheme;
+        # anything else in a checkpoint config would silently get wrong RoPE.
+        if rope_type not in ("2d", "default"):
+            raise NotImplementedError(f"rope_type `{rope_type}` not supported")
         self.rope_theta = rope_theta
         self.head_dim = head_dim
-        self.rope_type = rope_type
         self.cos_cache = None
         self.sin_cache = None
         self.seq_len = None
@@ -256,32 +179,28 @@ class CachedRoPE:
 
     def __call__(self, seq_len, device, rope_image_info=None):
         if (self.seq_len != seq_len) or (rope_image_info is not None and self.rope_image_info != rope_image_info):
-            if self.rope_type in ["2d", "default"]:
-                self.cos_cache, self.sin_cache = build_batch_2d_rope(
-                    image_infos=rope_image_info,
-                    seq_len=seq_len,
-                    n_elem=self.head_dim,
-                    device=device,
-                    base=self.rope_theta,
-                )
-            else:
-                raise NotImplementedError(f"rope_type `{self.rope_type}` not supported")
+            self.cos_cache, self.sin_cache = build_batch_2d_rope(
+                image_infos=rope_image_info,
+                seq_len=seq_len,
+                n_elem=self.head_dim,
+                device=device,
+                base=self.rope_theta,
+            )
             self.seq_len = seq_len
             self.rope_image_info = rope_image_info
 
         return self.cos_cache, self.sin_cache
 
 
-def image_attention(query, key, value, attn_metadata, attention_mask):
+def image_attention(query, key, value, attention_mask):
     """Masked full-sequence attention for the diffusion loop (no KV cache).
 
     Packed ``[tokens, heads, dim]`` inputs, 4-D bool mask. GQA KV heads are
     broadcast natively by SDPA (``enable_gqa``) instead of materializing
     repeated KV heads.
     """
+    bs, _, q_len, _ = attention_mask.shape
     total_tokens = query.shape[0]
-    bs = len(attn_metadata.query_lens)
-    q_len = total_tokens // bs
     head_num_per_rank = query.shape[1]
     kv_head_num_per_rank = key.shape[1]
     head_dim = query.shape[2]

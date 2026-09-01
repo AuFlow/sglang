@@ -43,7 +43,6 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import HunyuanImag
 from .hunyuan_image3_utils import (
     CachedRoPE,
     HunYuanRotary2DEmbedder,
-    create_hunyuan_image_attention_meta,
     image_attention,
 )
 
@@ -185,7 +184,7 @@ def _make_rope(config: PretrainedConfig, head_dim: int, rope_theta, rope_scaling
     )
 
 
-class HunYuanAttention1(nn.Module):
+class HunYuanAttention(nn.Module):
     """Self-attention; CLA followers attend to the master's K/V via ``kv_states``."""
 
     def __init__(
@@ -275,12 +274,11 @@ class HunYuanAttention1(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         hidden_states: torch.Tensor,
-        attn_meta,
         custom_pos_emb,
     ):
         """Apply the 2D image RoPE (diffusion path) or the 1D text RoPE."""
-        if attn_meta is not None:
-            return self.image_rope2d_emb(q, k, hidden_states, custom_pos_emb, attn_meta)
+        if custom_pos_emb is not None:
+            return self.image_rope2d_emb(q, k, hidden_states, custom_pos_emb)
         return self.rotary_emb(positions, q, k)
 
     def forward(
@@ -289,7 +287,6 @@ class HunYuanAttention1(nn.Module):
         hidden_states,
         forward_batch,
         kv_states=None,
-        attn_meta=None,
         attention_mask=None,
         custom_pos_emb=None,
     ):
@@ -302,14 +299,13 @@ class HunYuanAttention1(nn.Module):
             k = ori_k
             q, _ = self.q_proj(hidden_states)
             q, _ = self._apply_rope(
-                positions, q, torch.empty_like(k), hidden_states, attn_meta,
-                custom_pos_emb,
+                positions, q, torch.empty_like(k), hidden_states, custom_pos_emb,
             )
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self._apply_rope(
-                positions, q, k, hidden_states, attn_meta, custom_pos_emb
+                positions, q, k, hidden_states, custom_pos_emb
             )
             ori_k = k
 
@@ -336,8 +332,8 @@ class HunYuanAttention1(nn.Module):
                     epsilon=self.rms_norm_eps,
                 )[0]
 
-        if attn_meta is not None:
-            attn_output = image_attention(q, k, v, attn_meta, attention_mask)
+        if attention_mask is not None:
+            attn_output = image_attention(q, k, v, attention_mask)
         else:
             q = q.view(-1, self.num_heads, self.head_dim)
             k = k.view(-1, self.num_kv_heads, self.head_dim)
@@ -382,7 +378,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
             quant_config=quant_config, bias=attention_bias,
             prefix=f"{prefix}.self_attn",
         )
-        self.self_attn = HunYuanAttention1(**attn_kwargs, is_cross_attention=attention_type == "cross")
+        self.self_attn = HunYuanAttention(**attn_kwargs, is_cross_attention=attention_type == "cross")
 
         if _is_moe(config):
             self.mlp = HunYuanSparseMoeBlock(
@@ -400,7 +396,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
 
     def forward(
         self, positions, hidden_states, forward_batch, residual,
-        kv_states=None, attn_meta=None, attention_mask=None, custom_pos_emb=None,
+        kv_states=None, attention_mask=None, custom_pos_emb=None,
     ):
         if attention_mask is not None:
             residual = hidden_states
@@ -409,7 +405,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
             hidden_states, ori_kv_states = self.self_attn(
                 positions=positions, hidden_states=hidden_states,
                 forward_batch=forward_batch, kv_states=kv_states,
-                attn_meta=attn_meta, attention_mask=attention_mask,
+                attention_mask=attention_mask,
                 custom_pos_emb=custom_pos_emb,
             )
             hidden_states = residual + hidden_states
@@ -480,22 +476,14 @@ class HunyuanImage3Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def forward_block(
-        self, hidden_states, attention_mask, custom_pos_emb,
-        attn_meta=None, num_image_tokens=None, first_step=False,
-        residual=None,
-    ):
-        if attn_meta is None:
-            attn_meta = create_hunyuan_image_attention_meta(
-                attention_mask, num_image_tokens, first_step
-            )
-
+    def forward_block(self, hidden_states, attention_mask, custom_pos_emb):
+        residual = None
         cla_factor = _get_cla_factor(self.config)
         prev_kv_states = None
         for i, layer in enumerate(self.layers):
             hidden_states, residual, kv_states = layer(
                 None, hidden_states, None, residual,
-                prev_kv_states, attn_meta, attention_mask, custom_pos_emb,
+                prev_kv_states, attention_mask, custom_pos_emb,
             )
             if getattr(self.config, "use_cla", False) and i % cla_factor == 0:
                 prev_kv_states = kv_states
@@ -594,10 +582,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         """DiT-style forward for denoising stage."""
         return hidden_states
 
-    def forward_block(
-        self, hidden_states, attention_mask, custom_pos_emb,
-        num_image_tokens=None, first_step=False, timestep=None,
-    ):
+    def forward_block(self, hidden_states, attention_mask, custom_pos_emb, timestep=None):
         # TeaCache gate: skip layers on similar steps, reuse the cached
         # residual; one decision covers the packed CFG batch.
         if timestep is not None and self.should_skip_forward_for_cached_states(
@@ -605,10 +590,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         ):
             return self.retrieve_cached_states(hidden_states).contiguous()
 
-        output = self.model.forward_block(
-            hidden_states, attention_mask, custom_pos_emb,
-            num_image_tokens=num_image_tokens, first_step=first_step,
-        )
+        output = self.model.forward_block(hidden_states, attention_mask, custom_pos_emb)
 
         if timestep is not None:
             self.maybe_cache_states(output, hidden_states)
