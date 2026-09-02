@@ -132,26 +132,15 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             server_args, model_path
         )
 
-        cpu_offload = server_args.dit_cpu_offload
-        # FSDP inference shards the ~80B backbone and streams it one decoder
-        # layer at a time. It requires RESIDENT residency, so it is mutually
-        # exclusive with DiT component-offload (should_use_fsdp_for_component):
-        # component-offload moves the whole module to the device in one piece
-        # and OOMs. Construct on CPU whenever the backbone will be FSDP-sharded
-        # or component-offloaded -- building the ~76 GiB/rank model directly on
-        # a 61 GiB device OOMs during MoE weight construction, before sharding.
-        use_fsdp = server_args.should_use_fsdp_for_component("transformer")
-        if use_fsdp and current_platform.is_mps():
-            logger.warning("Disabling FSDP for MPS platform as it's not compatible")
-            use_fsdp = False
-        build_on_cpu = (
-            bool(cpu_offload)
-            or use_fsdp
-            or server_args.should_start_component_on_cpu("transformer")
-        )
+        local_torch_device = get_local_torch_device()
+        cpu_offload = bool(server_args.dit_cpu_offload)
         checkpoint_load_device = (
-            torch.device("cpu") if build_on_cpu else get_local_torch_device()
+            torch.device("cpu") if cpu_offload else local_torch_device
         )
+        fsdp_inference = bool(server_args.use_fsdp_inference)
+        if fsdp_inference and current_platform.is_mps():
+            logger.warning("Disabling FSDP for MPS platform as it's not compatible")
+            fsdp_inference = False
 
         param_dtype = PRECISION_TO_TYPE[pipeline_config.dit_precision]
         logger.info(
@@ -189,14 +178,11 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             for param in model.parameters():
                 param.requires_grad = False
 
-            if use_fsdp:
+            if fsdp_inference:
                 self._shard_ar_model(
                     model,
                     server_args=server_args,
-                    # The 80B MoE does not fit resident on one accelerator even
-                    # after FSDP sharding, so keep the sharded params in pinned
-                    # host memory and gather a single decoder layer at a time.
-                    cpu_offload=True,
+                    cpu_offload=cpu_offload,
                     param_dtype=param_dtype,
                 )
         model.eval()
@@ -210,17 +196,7 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         cpu_offload: bool,
         param_dtype: torch.dtype,
     ) -> None:
-        """Apply FSDP sharding to the already-loaded AR backbone.
-
-        HunyuanImage-3.0 is an ~80B-total / 13B-active MoE whose per-rank
-        weights (~76 GiB at TP=2) exceed a single 61 GiB accelerator. FSDP2
-        shards each decoder layer and, with ``cpu_offload``, keeps the sharded
-        params in pinned host memory and gathers one layer to the device at a
-        time (``reshard_after_forward``), so the backbone runs without a
-        resident full-model copy. ``shard_model`` falls back to sharding the
-        ``model.layers`` ModuleList entries when the model declares no explicit
-        ``_fsdp_shard_conditions``.
-        """
+        """Apply FSDP sharding to the already-loaded AR backbone."""
         mp_policy = MixedPrecisionPolicy(
             param_dtype=param_dtype,
             reduce_dtype=torch.float32,
