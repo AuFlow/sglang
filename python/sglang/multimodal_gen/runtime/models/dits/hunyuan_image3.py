@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import HunyuanImage3DitConfig
 
@@ -650,8 +653,15 @@ class HunyuanImage3Model(nn.Module):
         return torch.concat((q, k, v))
 
 
-class HunyuanImage3ForCausalMM(CachableDiT):
+class HunyuanImage3ForCausalMM(CachableDiT, LayerwiseOffloadableModuleMixin):
     """Top-level HunyuanImage-3 model for diffusion pipeline."""
+
+    # The ~80B backbone is ~61 GiB/rank at TP=2 -- it fills a 61 GiB NPU with
+    # no room for activations, so it cannot run fully resident. Declaring the
+    # decoder-layer ModuleList lets layerwise offload stream these layers
+    # CPU<->device one at a time (the same mechanism MiniMaxH3 uses for its
+    # 61.73 GiB DiT), which fits without FSDP.
+    layer_names = ["model.layers"]
 
     def __init__(
         self, config: HunyuanImage3DitConfig, prefix: str = "", **kwargs,
