@@ -371,21 +371,16 @@ class HunYuanAttention(nn.Module):
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.layer_id = layer_id
 
-        if is_cross_attention:
-            self.q_proj = ColumnParallelLinear(
-                hidden_size, hidden_size, bias=bias, quant_config=quant_config,
-                prefix=f"{prefix}.q_proj",
-            )
-        else:
-            self.qkv_proj = QKVParallelLinear(
-                hidden_size,
-                self.head_dim,
-                self.total_num_heads,
-                self.total_num_kv_heads,
-                bias=bias,
-                quant_config=quant_config,
-                prefix=f"{prefix}.qkv_proj",
-            )
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -1003,6 +998,54 @@ class LightProjector(nn.Module):
 
     def forward(self, x):
         return self.layers(x)
+
+
+class _HunyuanImage3CacheDitBlock(nn.Module):
+    """Pattern_1 view of one decoder layer for cache-dit.
+
+    cache-dit drives blocks as ``(hidden_states, *conds) -> hidden_states``
+    (ForwardPattern.Pattern_1); the real layer has the AR-backbone signature
+    ``(positions, hidden, forward_batch, residual, kv_states, mask, pos_emb)
+    -> (hidden, residual, kv)``. In the masked diffusion path the layer resets
+    ``residual = hidden`` internally and CLA is off, so it is a pure
+    ``hidden -> hidden`` map with the two condition tensors passed through.
+
+    The real layer is held by plain reference (object.__setattr__) so its
+    parameters stay registered only under ``HunyuanImage3Model.layers`` -- no
+    double registration in named_parameters/state_dict.
+    """
+
+    def __init__(self, layer: nn.Module):
+        super().__init__()
+        object.__setattr__(self, "_layer", layer)
+
+    def forward(self, hidden_states, attention_mask, custom_pos_emb):
+        hidden_states, _, _ = self._layer(
+            None, hidden_states, None, None, None, attention_mask, custom_pos_emb,
+        )
+        return hidden_states
+
+
+class HunyuanImage3CacheDitAdapter(nn.Module):
+    """cache-dit-wrappable view of the diffusion block loop.
+
+    ``forward`` matches ForwardPattern.Pattern_1 so DBCache caches the
+    hidden_states residual across steps and threads ``attention_mask`` /
+    ``custom_pos_emb`` through every block unchanged. This is the module handed
+    to ``enable_cache_on_transformer``; it is registered in
+    ``_CUSTOM_BLOCK_ADAPTER_SPECS`` under its class name.
+    """
+
+    def __init__(self, model: "HunyuanImage3Model"):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [_HunyuanImage3CacheDitBlock(layer) for layer in model.layers]
+        )
+
+    def forward(self, hidden_states, attention_mask, custom_pos_emb):
+        for block in self.blocks:
+            hidden_states = block(hidden_states, attention_mask, custom_pos_emb)
+        return hidden_states.contiguous()
 
 
 EntryClass = [HunyuanImage3ForCausalMM]

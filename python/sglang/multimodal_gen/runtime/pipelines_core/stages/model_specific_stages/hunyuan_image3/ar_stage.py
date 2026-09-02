@@ -30,6 +30,16 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import load_dict
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image
 
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+    CacheDitConfig,
+    enable_cache_on_transformer,
+    refresh_context_on_transformer,
+)
+from sglang.multimodal_gen.runtime.models.dits.hunyuan_image3 import (
+    HunyuanImage3CacheDitAdapter,
+)
+
 from .prompts import resolve_system_prompt
 from .tokenizer import (
     HunyuanImage3TokenizerWrapper,
@@ -78,7 +88,10 @@ def _build_causal_attention_mask(
     image_slices: list[list[slice]],
     device: torch.device,
 ) -> torch.Tensor:
-    mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).tril(0).repeat(batch_size, 1, 1)
+    # Build the causal base in one allocation via an index compare instead of
+    # ones().tril(), which transiently holds two full [L, L] bool tensors.
+    idx = torch.arange(seq_len, device=device)
+    mask = (idx.unsqueeze(0) <= idx.unsqueeze(1)).repeat(batch_size, 1, 1)
 
     for i in range(batch_size):
         for image_slice in image_slices[i]:
@@ -170,6 +183,8 @@ class HunyuanImage3AR(PipelineStage):
         self._vision_aligner = vision_aligner
         self._custom_tokenizer = HunyuanImage3TokenizerWrapper(tokenizer)
         self._gen_config_cache: dict | None = None
+        self._cache_dit_adapter = None
+        self._cache_dit_num_steps: int | None = None
 
     def _generation_config(self) -> dict:
         if self._gen_config_cache is None:
@@ -202,6 +217,53 @@ class HunyuanImage3AR(PipelineStage):
         new_info.__dict__.update(image_info.__dict__)
         return new_info
 
+    def _build_cache_dit_config(self, num_inference_steps: int) -> CacheDitConfig:
+        return CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=envs.SGLANG_CACHE_DIT_FN,
+            Bn_compute_blocks=envs.SGLANG_CACHE_DIT_BN,
+            max_warmup_steps=envs.SGLANG_CACHE_DIT_WARMUP,
+            residual_diff_threshold=envs.SGLANG_CACHE_DIT_RDT,
+            max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
+            enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
+            taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
+            num_inference_steps=num_inference_steps,
+        )
+
+    def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
+        """Mount cache-dit on the diffusion block loop (env-gated, idempotent).
+
+        Mirrors DenoisingStage._maybe_enable_cache_dit for this custom stage.
+        The AR backbone is not a diffusers DiT, so it is exposed to cache-dit
+        through HunyuanImage3CacheDitAdapter (ForwardPattern.Pattern_1); the
+        SGLANG_CACHE_DIT_* env vars then apply exactly as for GLM-Image/Wan.
+        """
+        if not envs.SGLANG_CACHE_DIT_ENABLED:
+            return
+        if self._cache_dit_adapter is None:
+            self._cache_dit_adapter = HunyuanImage3CacheDitAdapter(self.ar_model.model)
+            tp_group = None
+            if model_parallel_is_initialized():
+                group = get_tp_group()
+                tp_group = group.device_group if group.world_size > 1 else None
+            enable_cache_on_transformer(
+                self._cache_dit_adapter,
+                self._build_cache_dit_config(num_inference_steps),
+                model_name="hunyuan_image3",
+                tp_group=tp_group,
+                has_separate_cfg=True,
+            )
+            self.log_info(
+                "cache-dit enabled on HunyuanImage-3 (Fn=%d Bn=%d W=%d R=%.2f "
+                "MC=%d TaylorSeer=%s)",
+                envs.SGLANG_CACHE_DIT_FN, envs.SGLANG_CACHE_DIT_BN,
+                envs.SGLANG_CACHE_DIT_WARMUP, envs.SGLANG_CACHE_DIT_RDT,
+                envs.SGLANG_CACHE_DIT_MC, envs.SGLANG_CACHE_DIT_TAYLORSEER,
+            )
+        # Refresh every batch: a new generation resets cache-dit's step counter.
+        refresh_context_on_transformer(self._cache_dit_adapter, num_inference_steps)
+        self._cache_dit_num_steps = num_inference_steps
+
     def _backbone_forward(
         self,
         hidden_states: torch.Tensor,
@@ -225,12 +287,15 @@ class HunyuanImage3AR(PipelineStage):
                 cos = tp_group.broadcast(cos, src=0)
                 sin = tp_group.broadcast(sin, src=0)
 
-        output = self.ar_model.forward_block(
-            hidden_states,
-            attention_mask,
-            (cos, sin),
-            timestep=timestep,
-        )
+        if self._cache_dit_adapter is not None:
+            output = self._cache_dit_adapter(hidden_states, attention_mask, (cos, sin))
+        else:
+            output = self.ar_model.forward_block(
+                hidden_states,
+                attention_mask,
+                (cos, sin),
+                timestep=timestep,
+            )
         # batch_size may differ after TP broadcast
         actual_batch = attention_mask.shape[0]
         actual_seq_len = output.shape[0] // actual_batch
@@ -752,14 +817,32 @@ class HunyuanImage3AR(PipelineStage):
     def _build_attention_and_rope(
         self, tokenizer_output, tokenizer_sections, actual_batch_size: int,
         seq_len: int, token_h: int, token_w: int, image_info, device,
+        do_cfg: bool = False,
     ):
         gen_slices = tokenizer_output.gen_image_slices
         joint_slices = tokenizer_output.joint_image_slices
         image_slices = [
             joint_slices[i] + gen_slices[i] for i in range(actual_batch_size)
         ]
+
+        # CFG packs [cond..., uncond...] and runs the two halves in separate
+        # backbone calls, so only one half's mask is live at a time. When both
+        # halves share an identical image-token layout (the usual case: same
+        # target image, only the text prompt differs), build one half-size
+        # [n_req, 1, L, L] mask and reuse it for both halves -- halving resident
+        # and peak mask memory on every rank. The slice-list compare is exact,
+        # so this stays byte-identical to the full-batch mask; any layout
+        # mismatch falls back to the full [actual_batch_size, 1, L, L] mask.
+        half_bs = actual_batch_size // 2
+        mask_shared = (
+            do_cfg
+            and actual_batch_size % 2 == 0
+            and image_slices[:half_bs] == image_slices[half_bs:]
+        )
+        mask_bs = half_bs if mask_shared else actual_batch_size
+        mask_slices = image_slices[:half_bs] if mask_shared else image_slices
         attention_mask = _build_causal_attention_mask(
-            actual_batch_size, seq_len, image_slices, device
+            mask_bs, seq_len, mask_slices, device
         )
 
         rope_image_info = _build_rope_image_info(
@@ -769,7 +852,7 @@ class HunyuanImage3AR(PipelineStage):
         cos, sin = self.ar_model.cached_rope(
             seq_len, device, rope_image_info=rope_image_info
         )
-        return attention_mask, cos, sin
+        return attention_mask, cos, sin, mask_shared
 
     def _latent_dims(self, height: int, width: int) -> tuple[int, int, int]:
         arch_config = self.ar_model.config
@@ -935,6 +1018,8 @@ class HunyuanImage3AR(PipelineStage):
         else:
             device = model_device
 
+        self._maybe_enable_cache_dit(num_inference_steps)
+
         tokenizer_bot_task = self._normalize_bot_task(head.bot_task)
         tokenizer_kwargs = self._build_tokenizer_kwargs(
             reqs, image_info, tokenizer_bot_task, cfg_factor
@@ -957,9 +1042,9 @@ class HunyuanImage3AR(PipelineStage):
         image_mask = tok["image_mask"]
         timestep_index = tok["timestep_index"]
 
-        attention_mask, cos, sin = self._build_attention_and_rope(
+        attention_mask, cos, sin, mask_shared = self._build_attention_and_rope(
             tokenizer_output, tokenizer_sections, actual_batch_size,
-            tok["seq_len"], token_h, token_w, image_info, device,
+            tok["seq_len"], token_h, token_w, image_info, device, do_cfg,
         )
 
         scheduler = self._scheduler
@@ -1035,14 +1120,18 @@ class HunyuanImage3AR(PipelineStage):
                 # CFG: run cond/uncond halves separately (halves peak attention memory).
                 if do_cfg:
                     half = hidden_states.shape[0] // 2
+                    # With a shared half-mask, reuse it for both calls instead of
+                    # slicing a full-batch mask whose two halves are never both live.
+                    cond_mask = attention_mask if mask_shared else attention_mask[:half]
+                    uncond_mask = attention_mask if mask_shared else attention_mask[half:]
                     out_cond = self._backbone_forward(
                         hidden_states[:half],
-                        attention_mask[:half], (cos[:half], sin[:half]),
+                        cond_mask, (cos[:half], sin[:half]),
                         timestep=t_expand[:half],
                     )
                     out_uncond = self._backbone_forward(
                         hidden_states[half:],
-                        attention_mask[half:], (cos[half:], sin[half:]),
+                        uncond_mask, (cos[half:], sin[half:]),
                         timestep=t_expand[half:],
                     )
                     backbone_out = torch.cat([out_cond, out_uncond], dim=0)
