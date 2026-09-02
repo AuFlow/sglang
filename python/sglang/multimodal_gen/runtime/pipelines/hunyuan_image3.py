@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+from torch.distributed import init_device_mesh
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from transformers import AutoTokenizer
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
@@ -11,6 +13,7 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
 )
+from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_safetensors_to_load,
 )
@@ -38,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3 import (
     HunyuanImage3AR,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_hf_config,
@@ -46,6 +50,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
+from sglang.multimodal_gen.utils import set_mixed_precision_policy
 from sglang.srt.models.siglip2 import Siglip2Model
 
 logger = init_logger(__name__)
@@ -131,6 +136,10 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         checkpoint_load_device = (
             torch.device("cpu") if cpu_offload else get_local_torch_device()
         )
+        fsdp_inference = bool(server_args.use_fsdp_inference)
+        if fsdp_inference and current_platform.is_mps():
+            logger.warning("Disabling FSDP for MPS platform as it's not compatible")
+            fsdp_inference = False
 
         param_dtype = PRECISION_TO_TYPE[pipeline_config.dit_precision]
         logger.info(
@@ -167,9 +176,60 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             model.post_load_weights()
             for param in model.parameters():
                 param.requires_grad = False
+
+            if fsdp_inference:
+                self._shard_ar_model(
+                    model,
+                    server_args=server_args,
+                    cpu_offload=cpu_offload,
+                    param_dtype=param_dtype,
+                )
         model.eval()
         self.memory_usages["transformer"] = _module_memory_gb(model)
         return model
+
+    def _shard_ar_model(
+        self,
+        model: torch.nn.Module,
+        server_args: ServerArgs,
+        cpu_offload: bool,
+        param_dtype: torch.dtype,
+    ) -> None:
+        """Apply FSDP sharding to the already-loaded AR backbone.
+
+        HunyuanImage-3.0 is an ~80B-total / 13B-active MoE whose per-rank
+        weights (~76 GiB at TP=2) exceed a single 61 GiB accelerator. FSDP2
+        shards each decoder layer and, with ``cpu_offload``, keeps the sharded
+        params in pinned host memory and gathers one layer to the device at a
+        time (``reshard_after_forward``), so the backbone runs without a
+        resident full-model copy. ``shard_model`` falls back to sharding the
+        ``model.layers`` ModuleList entries when the model declares no explicit
+        ``_fsdp_shard_conditions``.
+        """
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=torch.float32,
+            cast_forward_inputs=False,
+        )
+        set_mixed_precision_policy(
+            param_dtype=param_dtype,
+            reduce_dtype=torch.float32,
+            mp_policy=mp_policy,
+        )
+        device_mesh = init_device_mesh(
+            current_platform.device_type,
+            mesh_shape=(server_args.hsdp_replicate_dim, server_args.hsdp_shard_dim),
+            mesh_dim_names=("replicate", "shard"),
+        )
+        shard_model(
+            model,
+            cpu_offload=cpu_offload,
+            reshard_after_forward=True,
+            mp_policy=mp_policy,
+            mesh=device_mesh,
+            fsdp_shard_conditions=getattr(model, "_fsdp_shard_conditions", None),
+            pin_cpu_memory=server_args.pin_cpu_memory,
+        )
 
     def _load_vae(
         self,

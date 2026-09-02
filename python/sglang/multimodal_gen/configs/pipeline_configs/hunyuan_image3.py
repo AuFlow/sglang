@@ -13,6 +13,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     SpatialImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
@@ -40,6 +43,23 @@ class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
 
     def __post_init__(self):
         self.vae_scale_factor = self.vae_config.get_vae_scale_factor()
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # HunyuanImage-3.0 is an ~80B-total / 13B-active MoE. Its per-rank
+        # weights (~76 GiB at TP=2) exceed a 61 GiB accelerator, so it must not
+        # inherit the generic image-gen keep-resident default (45 GiB): that
+        # keeps the DiT resident, builds the whole backbone on-device, and OOMs
+        # during MoE weight construction. Require a very high free-memory bar
+        # before the DiT stays resident, so normal cards keep DiT offload
+        # enabled and run it via FSDP (--use-fsdp-inference) CPU-offloaded
+        # per-layer sharding instead. CFG is handled internally by the AR
+        # stage's cond/uncond batching, so framework CFG-parallel is disabled
+        # (it would split ranks that all need the sharded weights).
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
+            auto_enable_cfg_parallel=False,
+        )
 
     def supports_dynamic_batching(self):
         # The AR stage batches compatible requests in one diffusion loop
