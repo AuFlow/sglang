@@ -9,8 +9,7 @@ import types
 from typing import Iterable, Optional, Tuple
 
 import torch
-from diffusers.models.embeddings import TimestepEmbedding, Timesteps
-from diffusers.models.resnet import ResnetBlock2D
+import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from transformers import PretrainedConfig
@@ -44,6 +43,7 @@ from .hunyuan_image3_utils import (
     CachedRoPE,
     HunYuanRotary2DEmbedder,
     image_attention,
+    timestep_embedding,
 )
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -58,48 +58,180 @@ UNEXPECTED_KEYWORDS = [
     "vision_model",
 ]
 
-# Official diffusion-I/O checkpoint key fragments mapped onto the diffusers
-# building-block attribute names they run on (see UNetDown/UNetUp below).
-_DIFFUSION_IO_KEY_MAP = [
-    ("in_layers.0.", "norm1."),
-    ("in_layers.2.", "conv1."),
-    ("emb_layers.1.", "time_emb_proj."),
-    ("out_layers.0.", "norm2."),
-    ("out_layers.3.", "conv2."),
-    ("skip_connection.", "conv_shortcut."),
-    ("mlp.0.", "mlp.linear_1."),
-    ("mlp.2.", "mlp.linear_2."),
-]
+# =============================================================
+# Diffusion I/O helper functions and modules
+# (ported from official HunyuanImage-3 model repository)
+# =============================================================
+
+def _conv_nd(dims, *args, **kwargs):
+    """Create a 1D, 2D, or 3D convolution module."""
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
 
 
-_RES_BLOCK_KWARGS = dict(
-    eps=1e-5,
-    non_linearity="swish",
-    time_embedding_norm="scale_shift",
-    kernel="sde_vp",
-)
+def _zero_module(module):
+    """Zero out the parameters of a module and return it."""
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+
+def _normalization(channels, **kwargs):
+    """GroupNorm normalization."""
+    return nn.GroupNorm(32, channels, **kwargs)
+
+
+class _Upsample(nn.Module):
+    """Upsample layer with optional convolution (dims=3 for spatial 2D)."""
+
+    def __init__(self, channels, use_conv, dims=2, out_channels=None, device=None, dtype=None):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.channels = channels
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.dims = dims
+        if use_conv:
+            self.conv = _conv_nd(dims, self.channels, self.out_channels, 3, padding=1, **factory_kwargs)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels
+        if self.dims == 3:
+            x = F.interpolate(
+                x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
+            )
+        else:
+            x = F.interpolate(x, scale_factor=2, mode="nearest")
+        if self.use_conv:
+            x = self.conv(x)
+        return x
+
+
+class _Downsample(nn.Module):
+    """Downsample layer with optional convolution (dims=3 for spatial 2D)."""
+
+    def __init__(self, channels, use_conv, dims=2, out_channels=None, device=None, dtype=None):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.channels = channels
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.dims = dims
+        stride = 2 if dims != 3 else (1, 2, 2)
+        if use_conv:
+            self.op = _conv_nd(
+                dims, self.channels, self.out_channels, 3, stride=stride, padding=1, **factory_kwargs
+            )
+        else:
+            assert self.channels == self.out_channels
+            self.op = nn.AvgPool2d(kernel_size=stride, stride=stride)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels
+        return self.op(x)
+
+
+class _ResBlock(nn.Module):
+    """Residual block with timestep embedding conditioning."""
+
+    def __init__(
+        self, in_channels, emb_channels, out_channels=None, dropout=0.0,
+        use_conv=False, dims=2, up=False, down=False, device=None, dtype=None,
+    ):
+        factory_kwargs = {"dtype": dtype, "device": device}
+        super().__init__()
+        self.in_channels = in_channels
+        self.dropout = dropout
+        self.out_channels = out_channels or self.in_channels
+
+        self.in_layers = nn.Sequential(
+            _normalization(self.in_channels, **factory_kwargs),
+            nn.SiLU(),
+            _conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs),
+        )
+
+        self.updown = up or down
+        if up:
+            self.h_upd = _Upsample(self.in_channels, False, dims, **factory_kwargs)
+            self.x_upd = _Upsample(self.in_channels, False, dims, **factory_kwargs)
+        elif down:
+            self.h_upd = _Downsample(self.in_channels, False, dims, **factory_kwargs)
+            self.x_upd = _Downsample(self.in_channels, False, dims, **factory_kwargs)
+        else:
+            self.h_upd = self.x_upd = nn.Identity()
+
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(emb_channels, 2 * self.out_channels, **factory_kwargs),
+        )
+
+        self.out_layers = nn.Sequential(
+            _normalization(self.out_channels, **factory_kwargs),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            _zero_module(
+                _conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1, **factory_kwargs)
+            ),
+        )
+
+        if self.out_channels == self.in_channels:
+            self.skip_connection = nn.Identity()
+        elif use_conv:
+            self.skip_connection = _conv_nd(
+                dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs
+            )
+        else:
+            self.skip_connection = _conv_nd(
+                dims, self.in_channels, self.out_channels, 1, **factory_kwargs
+            )
+
+    def forward(self, x, emb):
+        if self.updown:
+            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+            h = in_rest(x)
+            h = self.h_upd(h)
+            x = self.x_upd(x)
+            h = in_conv(h)
+        else:
+            h = self.in_layers(x)
+
+        emb_out = self.emb_layers(emb)
+        while len(emb_out.shape) < len(h.shape):
+            emb_out = emb_out[..., None]
+
+        out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+        scale, shift = torch.chunk(emb_out, 2, dim=1)
+        h = out_norm(h) * (1.0 + scale) + shift
+        h = out_rest(h)
+
+        return self.skip_connection(x) + h
 
 
 class TimestepEmbedder(nn.Module):
-    """Embeds scalar timesteps into vector representations (GELU MLP over the
-    official sinusoidal projection: cos/sin order, no freq downscale shift)."""
+    """Embeds scalar timesteps into vector representations."""
 
-    def __init__(self, hidden_size, frequency_embedding_size=256, out_size=None):
+    def __init__(self, hidden_size, act_layer=nn.GELU, frequency_embedding_size=256,
+                 max_period=10000, out_size=None, dtype=None, device=None):
+        factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
-        self.time_proj = Timesteps(
-            num_channels=frequency_embedding_size,
-            flip_sin_to_cos=True,
-            downscale_freq_shift=0,
-        )
-        self.mlp = TimestepEmbedding(
-            in_channels=frequency_embedding_size,
-            time_embed_dim=hidden_size,
-            act_fn="gelu",
-            out_dim=out_size,
+        self.frequency_embedding_size = frequency_embedding_size
+        self.max_period = max_period
+        if out_size is None:
+            out_size = hidden_size
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True, **factory_kwargs),
+            act_layer(),
+            nn.Linear(hidden_size, out_size, bias=True, **factory_kwargs),
         )
 
     def forward(self, t):
-        t_freq = self.time_proj(t).to(self.mlp.linear_1.weight.dtype)
+        t_freq = timestep_embedding(t, self.frequency_embedding_size, self.max_period)
+        t_freq = t_freq.type(self.mlp[0].weight.dtype)
         return self.mlp(t_freq)
 
 
@@ -107,36 +239,32 @@ class UNetDown(nn.Module):
     """Patch embed: converts noise latents (B, C, H, W) into sequence embeddings."""
 
     def __init__(self, patch_size, in_channels, emb_channels, hidden_channels,
-                 out_channels, dropout=0.0):
+                 out_channels, dropout=0.0, device=None, dtype=None):
+        factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
         self.patch_size = patch_size
 
         self.model = nn.ModuleList([
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)
+            _conv_nd(2, in_channels=in_channels, out_channels=hidden_channels,
+                     kernel_size=3, padding=1, **factory_kwargs)
         ])
         if self.patch_size == 1:
-            self.model.append(ResnetBlock2D(
-                in_channels=hidden_channels,
-                out_channels=out_channels,
-                dropout=dropout,
-                temb_channels=emb_channels,
-                **_RES_BLOCK_KWARGS,
+            self.model.append(_ResBlock(
+                in_channels=hidden_channels, emb_channels=emb_channels,
+                out_channels=out_channels, dropout=dropout, **factory_kwargs,
             ))
         else:
             for i in range(self.patch_size // 2):
-                self.model.append(ResnetBlock2D(
-                    in_channels=hidden_channels,
+                self.model.append(_ResBlock(
+                    in_channels=hidden_channels, emb_channels=emb_channels,
                     out_channels=(hidden_channels if (i + 1) * 2 != self.patch_size else out_channels),
-                    dropout=dropout,
-                    temb_channels=emb_channels,
-                    down=True,
-                    **_RES_BLOCK_KWARGS,
+                    dropout=dropout, down=True, **factory_kwargs,
                 ))
 
     def forward(self, x, t):
         assert x.shape[2] % self.patch_size == 0 and x.shape[3] % self.patch_size == 0
         for module in self.model:
-            if isinstance(module, ResnetBlock2D):
+            if isinstance(module, _ResBlock):
                 x = module(x, t)
             else:
                 x = module(x)
@@ -149,44 +277,41 @@ class UNetUp(nn.Module):
     """Final layer: converts backbone output sequence into noise predictions."""
 
     def __init__(self, patch_size, in_channels, emb_channels, hidden_channels,
-                 out_channels, dropout=0.0, out_norm=False):
+                 out_channels, dropout=0.0, device=None, dtype=None, out_norm=False):
+        factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
         self.patch_size = patch_size
         self.model = nn.ModuleList()
 
         if self.patch_size == 1:
-            self.model.append(ResnetBlock2D(
-                in_channels=in_channels,
-                out_channels=hidden_channels,
-                dropout=dropout,
-                temb_channels=emb_channels,
-                **_RES_BLOCK_KWARGS,
+            self.model.append(_ResBlock(
+                in_channels=in_channels, emb_channels=emb_channels,
+                out_channels=hidden_channels, dropout=dropout, **factory_kwargs,
             ))
         else:
             for i in range(self.patch_size // 2):
-                self.model.append(ResnetBlock2D(
+                self.model.append(_ResBlock(
                     in_channels=in_channels if i == 0 else hidden_channels,
-                    out_channels=hidden_channels,
-                    dropout=dropout,
-                    temb_channels=emb_channels,
-                    up=True,
-                    **_RES_BLOCK_KWARGS,
+                    emb_channels=emb_channels, out_channels=hidden_channels,
+                    dropout=dropout, up=True, **factory_kwargs,
                 ))
 
         if out_norm:
             self.model.append(nn.Sequential(
-                nn.GroupNorm(32, hidden_channels),
+                _normalization(hidden_channels, **factory_kwargs),
                 nn.SiLU(),
-                nn.Conv2d(hidden_channels, out_channels, kernel_size=3, padding=1),
+                _conv_nd(2, hidden_channels, out_channels, kernel_size=3,
+                         padding=1, **factory_kwargs),
             ))
         else:
-            self.model.append(nn.Conv2d(
-                hidden_channels, out_channels, kernel_size=3, padding=1))
+            self.model.append(_conv_nd(
+                2, hidden_channels, out_channels, kernel_size=3,
+                padding=1, **factory_kwargs))
 
     def forward(self, x, t, token_h, token_w):
         x = rearrange(x, "b (h w) c -> b c h w", h=token_h, w=token_w)
         for module in self.model:
-            if isinstance(module, ResnetBlock2D):
+            if isinstance(module, _ResBlock):
                 x = module(x, t)
             else:
                 x = module(x)
@@ -695,14 +820,6 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
-            # Diffusion I/O runs on diffusers blocks; remap the official
-            # checkpoint names onto their attribute names.
-            if name.startswith(
-                ("patch_embed.", "final_layer.", "time_embed", "timestep_emb")
-            ):
-                for old, new in _DIFFUSION_IO_KEY_MAP:
-                    if old in name:
-                        name = name.replace(old, new)
             if "gate_proj_bias" in name:
                 name = name.replace("gate_proj_bias", "gate_proj.bias")
             if "up_proj_bias" in name:
