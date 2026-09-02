@@ -9,6 +9,7 @@ import types
 from typing import Iterable, Optional, Tuple
 
 import torch
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.resnet import ResnetBlock2D
 from einops import rearrange
 from torch import nn
@@ -31,7 +32,6 @@ from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-from sglang.multimodal_gen.runtime.layers.visual_embedding import TimestepEmbedder
 
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -67,8 +67,8 @@ _DIFFUSION_IO_KEY_MAP = [
     ("out_layers.0.", "norm2."),
     ("out_layers.3.", "conv2."),
     ("skip_connection.", "conv_shortcut."),
-    ("mlp.0.", "mlp.fc_in."),
-    ("mlp.2.", "mlp.fc_out."),
+    ("mlp.0.", "mlp.linear_1."),
+    ("mlp.2.", "mlp.linear_2."),
 ]
 
 
@@ -78,6 +78,29 @@ _RES_BLOCK_KWARGS = dict(
     time_embedding_norm="scale_shift",
     kernel="sde_vp",
 )
+
+
+class TimestepEmbedder(nn.Module):
+    """Embeds scalar timesteps into vector representations (GELU MLP over the
+    official sinusoidal projection: cos/sin order, no freq downscale shift)."""
+
+    def __init__(self, hidden_size, frequency_embedding_size=256, out_size=None):
+        super().__init__()
+        self.time_proj = Timesteps(
+            num_channels=frequency_embedding_size,
+            flip_sin_to_cos=True,
+            downscale_freq_shift=0,
+        )
+        self.mlp = TimestepEmbedding(
+            in_channels=frequency_embedding_size,
+            time_embed_dim=hidden_size,
+            act_fn="gelu",
+            out_dim=out_size,
+        )
+
+    def forward(self, t):
+        t_freq = self.time_proj(t).to(self.mlp.linear_1.weight.dtype)
+        return self.mlp(t_freq)
 
 
 class UNetDown(nn.Module):
@@ -532,7 +555,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             latent_channels = arch_config.latent_channels
 
         if img_proj_type == "unet":
-            self.timestep_emb = TimestepEmbedder(hidden_size=arch_config.hidden_size, act_layer="gelu")
+            self.timestep_emb = TimestepEmbedder(hidden_size=arch_config.hidden_size)
             self.patch_embed = UNetDown(
                 patch_size=patch_size,
                 emb_channels=arch_config.hidden_size,
@@ -540,7 +563,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                 hidden_channels=patch_embed_hidden_dim,
                 out_channels=arch_config.hidden_size,
             )
-            self.time_embed = TimestepEmbedder(hidden_size=arch_config.hidden_size, act_layer="gelu")
+            self.time_embed = TimestepEmbedder(hidden_size=arch_config.hidden_size)
             self.final_layer = UNetUp(
                 patch_size=patch_size,
                 emb_channels=arch_config.hidden_size,
@@ -549,7 +572,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
                 out_channels=latent_channels,
                 out_norm=True,
             )
-            self.time_embed_2 = TimestepEmbedder(hidden_size=arch_config.hidden_size, act_layer="gelu")
+            self.time_embed_2 = TimestepEmbedder(hidden_size=arch_config.hidden_size)
         else:
             raise ValueError(f"Unknown img_proj_type: {img_proj_type}")
 
