@@ -144,7 +144,11 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         if use_fsdp and current_platform.is_mps():
             logger.warning("Disabling FSDP for MPS platform as it's not compatible")
             use_fsdp = False
-        build_on_cpu = bool(cpu_offload) or use_fsdp
+        build_on_cpu = (
+            bool(cpu_offload)
+            or use_fsdp
+            or server_args.should_start_component_on_cpu("transformer")
+        )
         checkpoint_load_device = (
             torch.device("cpu") if build_on_cpu else get_local_torch_device()
         )
