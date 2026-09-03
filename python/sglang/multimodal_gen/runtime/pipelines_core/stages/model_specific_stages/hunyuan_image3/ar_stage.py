@@ -37,7 +37,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_transformer,
 )
 from sglang.multimodal_gen.runtime.models.dits.hunyuan_image3 import (
-    HunyuanImage3CacheDitAdapter,
+    Hi3CacheBlockAdapter,
 )
 
 from .prompts import resolve_system_prompt
@@ -159,6 +159,30 @@ def _build_rope_image_info(
     return rope_image_info
 
 
+def _register_hi3_cache_dit_spec() -> None:
+    """Register Hi3CacheBlockAdapter's cache-dit block spec (idempotent).
+
+    cache-dit resolves a module's adapter by class-name prefix; the adapter is
+    named to avoid every built-in prefix, so enable_cache_on_transformer falls
+    back to _CUSTOM_BLOCK_ADAPTER_SPECS. That registry lives in the shared
+    cache_dit_integration module -- we add our entry here (model side) to keep
+    the shared module generic and untouched.
+    """
+    from cache_dit import ForwardPattern
+
+    from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+        _CUSTOM_BLOCK_ADAPTER_SPECS,
+        CustomBlockAdapterSpec,
+    )
+
+    _CUSTOM_BLOCK_ADAPTER_SPECS.setdefault(
+        Hi3CacheBlockAdapter.__name__,
+        CustomBlockAdapterSpec(
+            blocks_attr="blocks", forward_pattern=ForwardPattern.Pattern_1
+        ),
+    )
+
+
 class HunyuanImage3AR(PipelineStage):
     """Native AR diffusion-loop stage for HunyuanImage-3."""
 
@@ -235,13 +259,14 @@ class HunyuanImage3AR(PipelineStage):
 
         Mirrors DenoisingStage._maybe_enable_cache_dit for this custom stage.
         The AR backbone is not a diffusers DiT, so it is exposed to cache-dit
-        through HunyuanImage3CacheDitAdapter (ForwardPattern.Pattern_1); the
+        through Hi3CacheBlockAdapter (ForwardPattern.Pattern_1); the
         SGLANG_CACHE_DIT_* env vars then apply exactly as for GLM-Image/Wan.
         """
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             return
         if self._cache_dit_adapter is None:
-            self._cache_dit_adapter = HunyuanImage3CacheDitAdapter(self.ar_model.model)
+            _register_hi3_cache_dit_spec()
+            self._cache_dit_adapter = Hi3CacheBlockAdapter(self.ar_model.model)
             tp_group = None
             if model_parallel_is_initialized():
                 group = get_tp_group()

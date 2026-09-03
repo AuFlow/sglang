@@ -1000,7 +1000,7 @@ class LightProjector(nn.Module):
         return self.layers(x)
 
 
-class _HunyuanImage3CacheDitBlock(nn.Module):
+class _Hi3CacheBlock(nn.Module):
     """Pattern_1 view of one decoder layer for cache-dit.
 
     cache-dit drives blocks as ``(hidden_states, *conds) -> hidden_states``
@@ -1026,20 +1026,28 @@ class _HunyuanImage3CacheDitBlock(nn.Module):
         return hidden_states
 
 
-class HunyuanImage3CacheDitAdapter(nn.Module):
+class Hi3CacheBlockAdapter(nn.Module):
     """cache-dit-wrappable view of the diffusion block loop.
 
     ``forward`` matches ForwardPattern.Pattern_1 so DBCache caches the
     hidden_states residual across steps and threads ``attention_mask`` /
     ``custom_pos_emb`` through every block unchanged. This is the module handed
-    to ``enable_cache_on_transformer``; it is registered in
-    ``_CUSTOM_BLOCK_ADAPTER_SPECS`` under its class name.
+    to ``enable_cache_on_transformer``; its spec is registered under this class
+    name by the AR stage (``_register_hi3_cache_dit_spec``).
+
+    The name deliberately does NOT start with ``HunyuanImage``: cache-dit's
+    ``BlockAdapterRegister.is_supported`` / ``get_adapter`` resolve a module by
+    ``cls_name.startswith(prefix)``, so a ``HunyuanImage3...`` name prefix-matches
+    cache-dit's built-in HunyuanImage (diffusers) adapter, which reads
+    ``transformer_blocks`` and mis-fires on this AR backbone. A non-colliding
+    name makes ``is_supported`` return False so the custom Pattern_1 spec
+    (``blocks_attr="blocks"``) is used instead.
     """
 
     def __init__(self, model: "HunyuanImage3Model"):
         super().__init__()
         self.blocks = nn.ModuleList(
-            [_HunyuanImage3CacheDitBlock(layer) for layer in model.layers]
+            [_Hi3CacheBlock(layer) for layer in model.layers]
         )
 
     def forward(self, hidden_states, attention_mask, custom_pos_emb):
