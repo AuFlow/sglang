@@ -50,8 +50,12 @@ from .tokenizer import (
 
 logger = init_logger(__name__)
 
-# Max cond images per VAE encode pass (conv activations grow with the batch).
-_COND_VAE_ENCODE_CHUNK = 2
+def _is_oom_error(exc: BaseException) -> bool:
+    """True for a device OOM: torch.OutOfMemoryError, or the RuntimeError that
+    some backends raise carrying an 'out of memory' message."""
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
 def _seed_for_output(seed, output_idx: int):
@@ -638,6 +642,37 @@ class HunyuanImage3AR(PipelineStage):
             return None
         return pixels[:length], length
 
+    def _encode_adaptive(self, count, run_batch):
+        """Encode ``count`` items via ``run_batch(indices) -> list`` in the
+        largest batch that fits.
+
+        Starts with every item in one batched call; on OOM it empties the cache,
+        halves the batch, and retries the same items -- down to one at a time.
+        Chunking is bit-safe here: VAE conv is independent per batch row and the
+        ViT packs images with cu_seqlens, so each image's embedding does not
+        depend on which other images share the call. A hard failure only occurs
+        when a single item cannot fit, which then propagates to the sequential
+        fallback in ``_encode_conditions``.
+        """
+        if count <= 0:
+            return []
+        results: list = []
+        start = 0
+        chunk = count
+        while start < count:
+            size = min(chunk, count - start)
+            try:
+                results.extend(run_batch(list(range(start, start + size))))
+                start += size
+            except (torch.OutOfMemoryError, RuntimeError) as e:
+                if not _is_oom_error(e):
+                    raise
+                torch.get_device_module().empty_cache()
+                if size <= 1:
+                    raise
+                chunk = size // 2
+        return results
+
     def _encode_conditions_batched(self, flat_infos, device):
         # Returns None when the images cannot be stacked (shape mismatch).
         vae_tensors = [
@@ -674,12 +709,10 @@ class HunyuanImage3AR(PipelineStage):
             dtype=torch.bfloat16,
             enabled=True,
         ):
-            vae_embeds: list = []
-            t_values: list = []
-            for chunk_start in range(0, len(vae_tensors), _COND_VAE_ENCODE_CHUNK):
-                chunk = vae_tensors[chunk_start : chunk_start + _COND_VAE_ENCODE_CHUNK]
+            def _run_vae(idxs):
                 batched_vae = torch.cat(
-                    [t.to(dtype=vae_tensors[0].dtype) for t in chunk], dim=0
+                    [vae_tensors[i].to(dtype=vae_tensors[0].dtype) for i in idxs],
+                    dim=0,
                 )
                 t_chunk, latents_chunk = self._vae_encode_cond_image(
                     batched_vae, device
@@ -691,45 +724,56 @@ class HunyuanImage3AR(PipelineStage):
                 image_seq, _, _ = self.ar_model.patch_embed(
                     latents_chunk.to(device), t_emb
                 )
-                vae_embeds.extend(
-                    image_seq[i] for i in range(image_seq.shape[0])
-                )
-                t_values.extend(
-                    t_chunk[i : i + 1] for i in range(len(chunk))
-                )
+                return [
+                    (image_seq[k], t_chunk[k : k + 1]) for k in range(len(idxs))
+                ]
 
-            pixel_values = torch.cat(
-                [
-                    p.to(device=device, dtype=vit_tensors[0].dtype)
-                    for p in packed_pixels
-                ],
-                dim=0,
-            ).unsqueeze(0)
-            # spatial_shapes must stay on CPU (asserted by the SRT embeddings).
-            spatial_shapes = torch.stack(spatial_shape_rows, dim=0)
-            cu_seqlens = torch.tensor(
-                [0] + list(torch.tensor(lengths).cumsum(0).tolist()),
-                dtype=torch.int32, device=device,
-            )
-            image_embed = self._vision_model(
-                pixel_values,
-                spatial_shapes=spatial_shapes,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max(lengths),
-            )
-            image_embed = self._vision_aligner(image_embed)
-            dim = image_embed.shape[-1]
-            vit_embeds: list = []
-            offset = 0
-            for i, length in enumerate(lengths):
-                emb = image_embed[0, offset : offset + length]
-                expected = vit_tensors[i].shape[0]
-                if expected > length:
-                    emb = torch.cat(
-                        [emb, emb.new_zeros(expected - length, dim)], dim=0
-                    )
-                vit_embeds.append(emb)
-                offset += length
+            vae_results = self._encode_adaptive(len(flat_infos), _run_vae)
+            vae_embeds = [r[0] for r in vae_results]
+            t_values = [r[1] for r in vae_results]
+
+            # ViT is batched the same way: cu_seqlens-packed attention isolates
+            # each image, so any batch size yields bit-identical embeddings.
+            def _run_vit(idxs):
+                chunk_lengths = [lengths[i] for i in idxs]
+                pixel_values = torch.cat(
+                    [
+                        packed_pixels[i].to(device=device, dtype=vit_tensors[0].dtype)
+                        for i in idxs
+                    ],
+                    dim=0,
+                ).unsqueeze(0)
+                # spatial_shapes must stay on CPU (asserted by the SRT embeddings).
+                spatial_shapes = torch.stack(
+                    [spatial_shape_rows[i] for i in idxs], dim=0
+                )
+                cu_seqlens = torch.tensor(
+                    [0] + list(torch.tensor(chunk_lengths).cumsum(0).tolist()),
+                    dtype=torch.int32, device=device,
+                )
+                image_embed = self._vision_model(
+                    pixel_values,
+                    spatial_shapes=spatial_shapes,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max(chunk_lengths),
+                )
+                image_embed = self._vision_aligner(image_embed)
+                dim = image_embed.shape[-1]
+                out: list = []
+                offset = 0
+                for j, i in enumerate(idxs):
+                    length = chunk_lengths[j]
+                    emb = image_embed[0, offset : offset + length]
+                    expected = vit_tensors[i].shape[0]
+                    if expected > length:
+                        emb = torch.cat(
+                            [emb, emb.new_zeros(expected - length, dim)], dim=0
+                        )
+                    out.append(emb)
+                    offset += length
+                return out
+
+            vit_embeds = self._encode_adaptive(len(flat_infos), _run_vit)
         return vae_embeds, t_values, vit_embeds
 
     def _scatter_cond_vae_tokens_batched(
