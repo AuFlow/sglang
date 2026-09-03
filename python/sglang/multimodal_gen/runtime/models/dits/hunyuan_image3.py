@@ -815,6 +815,17 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             arch_config, prefix=f"{prefix}.model",
         )
 
+        self.unpadded_vocab_size = arch_config.vocab_size
+        # multimodal_gen has no dedicated LM-head layer; the vocab-parallel
+        # embedding shares its layout and only `.weight` is consumed downstream.
+        self.lm_head = VocabParallelEmbedding(
+            self.unpadded_vocab_size, arch_config.hidden_size,
+            org_num_embeddings=self.unpadded_vocab_size,
+            prefix=f"{prefix}.lm_head",
+        )
+        if getattr(arch_config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
+
         # ---- Diffusion I/O modules ----
         patch_size = getattr(arch_config, "patch_size", 1)
         patch_embed_hidden_dim = getattr(arch_config, "patch_embed_hidden_dim", 1024)
@@ -871,6 +882,17 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         if timestep is not None:
             self.maybe_cache_states(output, hidden_states)
         return output
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     # TeaCache — see runtime/cache/teacache.py
 
@@ -971,6 +993,8 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             if "up_proj_bias" in name:
                 name = name.replace("up_proj_bias", "up_proj.bias")
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                continue
+            if getattr(self.config, "tie_word_embeddings", False) and "lm_head.weight" in name:
                 continue
 
             if name.endswith("wte.weight"):
@@ -1104,7 +1128,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         if missing:
             significant_missing = [
                 n for n in missing
-                if not any(k in n for k in ["rotary_emb"])
+                if not any(k in n for k in ["rotary_emb", "lm_head"])
             ]
             if significant_missing:
                 logger.warning(
