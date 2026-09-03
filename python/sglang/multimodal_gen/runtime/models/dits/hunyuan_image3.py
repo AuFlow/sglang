@@ -16,18 +16,20 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.models.hunyuan import (
-    HunYuanMLP,
-    HunYuanSparseMoeBlock,
     _get_cla_factor,
     _is_moe,
 )
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
@@ -332,6 +334,140 @@ def _make_rope(config: PretrainedConfig, head_dim: int, rope_theta, rope_scaling
     )
 
 
+def _get_layer_value(config: PretrainedConfig, field: str, layer_id: int, default=None):
+    value = getattr(config, field, default)
+    if isinstance(value, list):
+        assert layer_id >= 0 and len(value) > layer_id, f"{field}[{layer_id}] missing"
+        return value[layer_id]
+    return value
+
+
+class HunYuanMLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: Optional[QuantizationConfig] = None,
+        bias: bool = False,
+        prefix: str = "",
+        reduce_results: bool = True,
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[intermediate_size] * 2,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            bias=bias,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+            prefix=f"{prefix}.down_proj",
+        )
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+            )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class HunYuanSparseMoeBlock(nn.Module):
+    """Sparse MoE block using SRT FusedMoE with separate TopK routing.
+
+    TopK handles softmax + top-k routing, FusedMoE handles expert computation.
+    A separate shared MLP (when present) is always applied to all tokens.
+    """
+
+    def __init__(
+        self, config: PretrainedConfig, layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None, prefix: str = "",
+    ):
+        super().__init__()
+        assert layer_id >= 0
+        self.tp_size = get_tp_world_size()
+        self.n_routed_experts = config.num_experts
+        self.layer_id = layer_id
+
+        top_k = _get_layer_value(config, "moe_topk", layer_id)
+        intermediate_size = _get_layer_value(config, "intermediate_size", layer_id, 0)
+        if getattr(config, "moe_intermediate_size", None) is not None:
+            intermediate_size = _get_layer_value(config, "moe_intermediate_size", layer_id)
+
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate",
+        )
+
+        self.topk = TopK(
+            top_k=top_k,
+            layer_id=layer_id,
+        )
+
+        if getattr(config, "use_mixed_mlp_moe", 0) > 0:
+            num_shared_expert = _get_layer_value(config, "num_shared_expert", layer_id)
+            self.shared_mlp = HunYuanMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size * num_shared_expert,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.shared_mlp",
+                reduce_results=True,
+            )
+        else:
+            self.shared_mlp = None
+
+        self.experts = FusedMoE(
+            num_experts=config.num_experts,
+            top_k=top_k,
+            hidden_size=config.hidden_size,
+            intermediate_size=intermediate_size,
+            reduce_results=True,
+            quant_config=quant_config,
+            layer_id=layer_id,
+            prefix=f"{prefix}.experts",
+        )
+
+    def forward(self, hidden_states):
+        orig_shape = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # Router logits: [num_tokens, num_experts]
+        router_logits, _ = self.gate(hidden_states)
+
+        # TopK routing: softmax + top-k selection
+        topk_output = self.topk(hidden_states, router_logits)
+
+        # FusedMoE expert computation
+        final_hidden_states = self.experts(hidden_states, topk_output)
+
+        # Shared MLP contribution (always applied to all tokens)
+        if self.shared_mlp is not None:
+            _shared_out = self.shared_mlp(hidden_states)
+            final_hidden_states = final_hidden_states + _shared_out
+
+        # NOTE: The AscendTPDispatcher's finalize routing performs all-gather
+        # internally for the FusedMoE output on NPU. The shared MLP's down_proj
+        # uses reduce_results=True to all-reduce its output across TP ranks.
+        # Both components are now properly TP-synchronized.
+
+        return final_hidden_states.view(orig_shape)
+
+
 class HunYuanAttention(nn.Module):
     """Self-attention; CLA followers attend to the master's K/V via ``kv_states``."""
 
@@ -371,15 +507,29 @@ class HunYuanAttention(nn.Module):
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.layer_id = layer_id
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
+        if is_cross_attention:
+            # CLA follower: project only Q; K/V are reused from the master layer
+            # via ``kv_states``. Matches the reference HunYuanCrossAttention and
+            # the weight loader, which skips the fused-qkv mapping for follower
+            # layers (layer_id % cla_factor != 0) and routes their ``.q_proj``
+            # weights to this standalone q_proj.
+            self.q_proj = ColumnParallelLinear(
+                hidden_size,
+                hidden_size,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_proj",
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -526,6 +676,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         if _is_moe(config):
             self.mlp = HunYuanSparseMoeBlock(
                 config=config, layer_id=layer_id, quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
             )
         else:
             self.mlp = HunYuanMLP(
