@@ -1001,10 +1001,10 @@ class LightProjector(nn.Module):
 
 
 class _Hi3CacheBlock(nn.Module):
-    """Pattern_1 view of one decoder layer for cache-dit.
+    """Pattern_3 view of one decoder layer for cache-dit.
 
     cache-dit drives blocks as ``(hidden_states, *conds) -> hidden_states``
-    (ForwardPattern.Pattern_1); the real layer has the AR-backbone signature
+    (ForwardPattern.Pattern_3); the real layer has the AR-backbone signature
     ``(positions, hidden, forward_batch, residual, kv_states, mask, pos_emb)
     -> (hidden, residual, kv)``. In the masked diffusion path the layer resets
     ``residual = hidden`` internally and CLA is off, so it is a pure
@@ -1029,7 +1029,7 @@ class _Hi3CacheBlock(nn.Module):
 class Hi3CacheBlockAdapter(nn.Module):
     """cache-dit-wrappable view of the diffusion block loop.
 
-    ``forward`` matches ForwardPattern.Pattern_1 so DBCache caches the
+    ``forward`` matches ForwardPattern.Pattern_3 so DBCache caches the
     hidden_states residual across steps and threads ``attention_mask`` /
     ``custom_pos_emb`` through every block unchanged. This is the module handed
     to ``enable_cache_on_transformer``; its spec is registered under this class
@@ -1040,7 +1040,7 @@ class Hi3CacheBlockAdapter(nn.Module):
     ``cls_name.startswith(prefix)``, so a ``HunyuanImage3...`` name prefix-matches
     cache-dit's built-in HunyuanImage (diffusers) adapter, which reads
     ``transformer_blocks`` and mis-fires on this AR backbone. A non-colliding
-    name makes ``is_supported`` return False so the custom Pattern_1 spec
+    name makes ``is_supported`` return False so the custom Pattern_3 spec
     (``blocks_attr="blocks"``) is used instead.
     """
 

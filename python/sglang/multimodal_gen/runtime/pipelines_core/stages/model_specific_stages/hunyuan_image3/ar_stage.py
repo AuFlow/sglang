@@ -178,7 +178,7 @@ def _register_hi3_cache_dit_spec() -> None:
     _CUSTOM_BLOCK_ADAPTER_SPECS.setdefault(
         Hi3CacheBlockAdapter.__name__,
         CustomBlockAdapterSpec(
-            blocks_attr="blocks", forward_pattern=ForwardPattern.Pattern_1
+            blocks_attr="blocks", forward_pattern=ForwardPattern.Pattern_3
         ),
     )
 
@@ -259,7 +259,7 @@ class HunyuanImage3AR(PipelineStage):
 
         Mirrors DenoisingStage._maybe_enable_cache_dit for this custom stage.
         The AR backbone is not a diffusers DiT, so it is exposed to cache-dit
-        through Hi3CacheBlockAdapter (ForwardPattern.Pattern_1); the
+        through Hi3CacheBlockAdapter (ForwardPattern.Pattern_3); the
         SGLANG_CACHE_DIT_* env vars then apply exactly as for GLM-Image/Wan.
         """
         if not envs.SGLANG_CACHE_DIT_ENABLED:
