@@ -585,31 +585,17 @@ class HunyuanImage3AR(PipelineStage):
                 t_values.append(t_i)
 
                 vit_kwargs = self._cond_vit_kwargs(info)
-                packed = self._pack_cond_vit_patches(info)
-                if packed is None:
-                    raise ValueError(
-                        "Cannot pack cond ViT patches for spatial_shapes "
-                        f"{vit_kwargs['spatial_shapes']}"
-                    )
-                pixels_packed, length = packed
+                # Reference Siglip2VisionTransformer takes the padded pixel_values
+                # + attention_mask + spatial_shapes and returns padded embeddings
+                # (zeros at padding), so no manual packing/re-padding is needed.
+                pixels = info.vision_image_info.image_tensor
                 image_embed = self._vision_model(
-                    pixels_packed.unsqueeze(0).to(device),
+                    pixels.unsqueeze(0).to(device),
+                    attention_mask=vit_kwargs["attention_mask"].to(device),
                     spatial_shapes=vit_kwargs["spatial_shapes"],
-                    cu_seqlens=torch.tensor(
-                        [0, length], dtype=torch.int32, device=device
-                    ),
-                    max_seqlen=length,
                 )
                 image_embed = self._vision_aligner(image_embed)
-                # Re-pad to the processor's padded length (scatter contract).
-                expected = info.vision_image_info.image_tensor.shape[0]
-                emb = image_embed[0]
-                if expected > length:
-                    emb = torch.cat(
-                        [emb, emb.new_zeros(expected - length, emb.shape[-1])],
-                        dim=0,
-                    )
-                vit_embeds.append(emb)
+                vit_embeds.append(image_embed[0])
         return vae_embeds, t_values, vit_embeds
 
     @staticmethod
@@ -630,18 +616,6 @@ class HunyuanImage3AR(PipelineStage):
             ].unsqueeze(0)
         return vit_kwargs
 
-    @staticmethod
-    def _pack_cond_vit_patches(info) -> tuple[torch.Tensor, int] | None:
-        vit_kwargs = HunyuanImage3AR._cond_vit_kwargs(info)
-        row = vit_kwargs["spatial_shapes"][0]
-        token_h = int(row[0].item())
-        token_w = int(row[1].item())
-        length = token_h * token_w
-        pixels = info.vision_image_info.image_tensor
-        if length <= 0 or length > pixels.shape[0]:
-            return None
-        return pixels[:length], length
-
     def _encode_adaptive(self, count, run_batch):
         """Encode ``count`` items via ``run_batch(indices) -> list`` in the
         largest batch that fits.
@@ -649,8 +623,9 @@ class HunyuanImage3AR(PipelineStage):
         Starts with every item in one batched call; on OOM it empties the cache,
         halves the batch, and retries the same items -- down to one at a time.
         Chunking is bit-safe here: VAE conv is independent per batch row and the
-        ViT packs images with cu_seqlens, so each image's embedding does not
-        depend on which other images share the call. A hard failure only occurs
+        ViT isolates each image via its attention_mask + spatial_shapes (packed
+        internally), so each image's embedding does not depend on which other
+        images share the call. A hard failure only occurs
         when a single item cannot fit, which then propagates to the sequential
         fallback in ``_encode_conditions``.
         """
@@ -687,20 +662,18 @@ class HunyuanImage3AR(PipelineStage):
         if any(t.ndim != 2 or t.shape[-1] != feat_dim for t in vit_tensors):
             return None
 
-        # SRT Siglip2 takes packed variable-length input via cu_seqlens;
-        # the packed output is re-padded afterwards (scatter contract).
-        packed_pixels: list = []
+        # Reference Siglip2VisionTransformer takes padded pixel_values +
+        # attention_mask + spatial_shapes (it unpacks/re-pads internally), so
+        # collect the per-image masks/shapes and feed the padded pixels. All
+        # images pad to the same max_patches, so they stack into one batch.
+        if len({t.shape[0] for t in vit_tensors}) > 1:
+            return None
+        vit_mask_rows: list = []
         spatial_shape_rows: list = []
-        lengths: list = []
         for info in flat_infos:
             vit_kwargs = self._cond_vit_kwargs(info)
-            packed = self._pack_cond_vit_patches(info)
-            if packed is None:
-                return None
-            pixels, length = packed
-            packed_pixels.append(pixels)
+            vit_mask_rows.append(vit_kwargs["attention_mask"][0])
             spatial_shape_rows.append(vit_kwargs["spatial_shapes"][0])
-            lengths.append(length)
 
         # Autocast matches the diffusion loop so cached embeddings stay
         # bit-identical with in-loop computation.
@@ -732,46 +705,31 @@ class HunyuanImage3AR(PipelineStage):
             vae_embeds = [r[0] for r in vae_results]
             t_values = [r[1] for r in vae_results]
 
-            # ViT is batched the same way: cu_seqlens-packed attention isolates
-            # each image, so any batch size yields bit-identical embeddings.
+            # ViT: feed padded pixels + attention_mask + spatial_shapes; the
+            # reference Siglip2VisionTransformer unpacks per image internally and
+            # returns padded embeddings, so any batch size is equivalent and the
+            # output rows are already padded to max_patches.
             def _run_vit(idxs):
-                chunk_lengths = [lengths[i] for i in idxs]
-                pixel_values = torch.cat(
+                pixel_values = torch.stack(
                     [
-                        packed_pixels[i].to(device=device, dtype=vit_tensors[0].dtype)
+                        vit_tensors[i].to(device=device, dtype=vit_tensors[0].dtype)
                         for i in idxs
                     ],
                     dim=0,
-                ).unsqueeze(0)
-                # spatial_shapes must stay on CPU (asserted by the SRT embeddings).
+                )
+                attention_mask = torch.stack(
+                    [vit_mask_rows[i].to(device) for i in idxs], dim=0
+                )
                 spatial_shapes = torch.stack(
                     [spatial_shape_rows[i] for i in idxs], dim=0
                 )
-                cu_seqlens = torch.tensor(
-                    [0] + list(torch.tensor(chunk_lengths).cumsum(0).tolist()),
-                    dtype=torch.int32, device=device,
-                )
                 image_embed = self._vision_model(
                     pixel_values,
+                    attention_mask=attention_mask,
                     spatial_shapes=spatial_shapes,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max(chunk_lengths),
                 )
                 image_embed = self._vision_aligner(image_embed)
-                dim = image_embed.shape[-1]
-                out: list = []
-                offset = 0
-                for j, i in enumerate(idxs):
-                    length = chunk_lengths[j]
-                    emb = image_embed[0, offset : offset + length]
-                    expected = vit_tensors[i].shape[0]
-                    if expected > length:
-                        emb = torch.cat(
-                            [emb, emb.new_zeros(expected - length, dim)], dim=0
-                        )
-                    out.append(emb)
-                    offset += length
-                return out
+                return [image_embed[b] for b in range(len(idxs))]
 
             vit_embeds = self._encode_adaptive(len(flat_infos), _run_vit)
         return vae_embeds, t_values, vit_embeds

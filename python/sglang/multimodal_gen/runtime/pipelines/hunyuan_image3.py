@@ -1,6 +1,5 @@
 import json
 import os
-from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -51,7 +50,6 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
-from sglang.srt.models.siglip2 import Siglip2Model
 
 logger = init_logger(__name__)
 
@@ -284,18 +282,22 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         config_dict: dict[str, Any],
     ) -> torch.nn.Module:
         vit_config = config_dict["vit"]
-        vision_model = Siglip2Model(SimpleNamespace(**vit_config), require_post_norm=True)
+        # Use the reference HunyuanImage-3 SigLIP2 ViT (plain PyTorch: padded
+        # pixel_values + attention_mask, F.sdpa packed attention) instead of SRT
+        # Siglip2Model, matching the hunyuan_image_3 branch's cond-image path.
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3_vision import (
+            Siglip2VisionTransformer,
+        )
+
+        vision_model = Siglip2VisionTransformer(vit_config)
 
         state_dict = self._collect_prefixed_weights(model_path, "vision_model.")
-        loaded = vision_model.load_weights(
-            (f"vision_model.{name}", tensor) for name, tensor in state_dict.items()
-        )
-        missing = set(dict(vision_model.named_parameters())) - loaded
-        if missing:
+        missing_keys, _unexpected = vision_model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
             logger.warning(
                 "vision_model missing %d key(s), e.g. %s",
-                len(missing),
-                sorted(missing)[:3],
+                len(missing_keys),
+                sorted(missing_keys)[:3],
             )
 
         device = get_local_torch_device()
