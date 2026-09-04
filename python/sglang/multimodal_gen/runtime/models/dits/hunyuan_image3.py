@@ -45,6 +45,7 @@ from .hunyuan_image3_utils import (
     CachedRoPE,
     HunYuanRotary2DEmbedder,
     ImageKVCacheManager,
+    create_hunyuan_image_attention_meta,
     timestep_embedding,
 )
 
@@ -581,6 +582,7 @@ class HunYuanAttention(nn.Module):
         hidden_states,
         forward_batch,
         kv_states=None,
+        attn_meta=None,
         attention_mask=None,
         custom_pos_emb=None,
     ):
@@ -626,8 +628,8 @@ class HunYuanAttention(nn.Module):
                     epsilon=self.rms_norm_eps,
                 )[0]
 
-        if attention_mask is not None:
-            attn_output = self.image_attn(q, k, v, attention_mask)
+        if attn_meta is not None:
+            attn_output = self.image_attn(q, k, v, attn_meta, attention_mask=attention_mask)
         else:
             q = q.view(-1, self.num_heads, self.head_dim)
             k = k.view(-1, self.num_kv_heads, self.head_dim)
@@ -691,7 +693,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
 
     def forward(
         self, positions, hidden_states, forward_batch, residual,
-        kv_states=None, attention_mask=None, custom_pos_emb=None,
+        kv_states=None, attn_meta=None, attention_mask=None, custom_pos_emb=None,
     ):
         if attention_mask is not None:
             residual = hidden_states
@@ -700,7 +702,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
             hidden_states, ori_kv_states = self.self_attn(
                 positions=positions, hidden_states=hidden_states,
                 forward_batch=forward_batch, kv_states=kv_states,
-                attention_mask=attention_mask,
+                attn_meta=attn_meta, attention_mask=attention_mask,
                 custom_pos_emb=custom_pos_emb,
             )
             hidden_states = residual + hidden_states
@@ -771,14 +773,22 @@ class HunyuanImage3Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def forward_block(self, hidden_states, attention_mask, custom_pos_emb):
+    def forward_block(
+        self, hidden_states, attention_mask, custom_pos_emb,
+        attn_meta=None, num_image_tokens=None, first_step=False,
+    ):
+        if attn_meta is None:
+            attn_meta = create_hunyuan_image_attention_meta(
+                attention_mask, num_image_tokens, first_step
+            )
+
         residual = None
         cla_factor = _get_cla_factor(self.config)
         prev_kv_states = None
         for i, layer in enumerate(self.layers):
             hidden_states, residual, kv_states = layer(
                 None, hidden_states, None, residual,
-                prev_kv_states, attention_mask, custom_pos_emb,
+                prev_kv_states, attn_meta, attention_mask, custom_pos_emb,
             )
             if getattr(self.config, "use_cla", False) and i % cla_factor == 0:
                 prev_kv_states = kv_states
@@ -870,7 +880,10 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         """DiT-style forward for denoising stage."""
         return hidden_states
 
-    def forward_block(self, hidden_states, attention_mask, custom_pos_emb, timestep=None):
+    def forward_block(
+        self, hidden_states, attention_mask, custom_pos_emb,
+        num_image_tokens=None, first_step=False, timestep=None,
+    ):
         # TeaCache gate: skip layers on similar steps, reuse the cached
         # residual; one decision covers the packed CFG batch.
         if timestep is not None and self.should_skip_forward_for_cached_states(
@@ -878,7 +891,10 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         ):
             return self.retrieve_cached_states(hidden_states).contiguous()
 
-        output = self.model.forward_block(hidden_states, attention_mask, custom_pos_emb)
+        output = self.model.forward_block(
+            hidden_states, attention_mask, custom_pos_emb,
+            num_image_tokens=num_image_tokens, first_step=first_step,
+        )
 
         if timestep is not None:
             self.maybe_cache_states(output, hidden_states)
@@ -1197,7 +1213,7 @@ class _Hi3CacheBlock(nn.Module):
 
     def forward(self, hidden_states, attention_mask, custom_pos_emb):
         hidden_states, _, _ = self._layer(
-            None, hidden_states, None, None, None, attention_mask, custom_pos_emb,
+            None, hidden_states, None, None, None, None, attention_mask, custom_pos_emb,
         )
         return hidden_states
 

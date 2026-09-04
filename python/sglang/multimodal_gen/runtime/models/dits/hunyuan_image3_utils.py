@@ -4,8 +4,8 @@ Ported from the official HunyuanImage-3 model repository
 (`modeling_hunyuan_image_3.py`).
 """
 
-import os
 import math
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from einops import repeat
 
@@ -26,6 +26,26 @@ def timestep_embedding(t, dim, max_period=10000):
     if dim % 2:
         embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
     return embedding
+
+
+@dataclass
+class HunYuanImageAttentionMeta:
+    query_lens: List[int]
+    seq_lens: List[int]
+    num_image_tokens: int
+    first_step: bool
+
+
+def create_hunyuan_image_attention_meta(
+    attention_mask: torch.Tensor, num_image_tokens: int, first_step: bool
+) -> HunYuanImageAttentionMeta:
+    b, _, q_len1, seq_len = attention_mask.shape
+    return HunYuanImageAttentionMeta(
+        query_lens=[q_len1] * b,
+        seq_lens=[seq_len] * b,
+        num_image_tokens=num_image_tokens,
+        first_step=first_step,
+    )
 
 
 def rotate_half(x):
@@ -209,74 +229,50 @@ class CachedRoPE:
         return self.cos_cache, self.sin_cache
 
 
-# Query-blocked attention.
-#
-# A TI2I (image-editing) request packs the reference image's VAE + ViT tokens
-# ahead of the generated-image tokens, so the packed sequence roughly doubles
-# versus text-to-image (~4.1k -> ~10k at 1024x1024). The dense-mask SDPA below
-# peaks at ~O(L^2) activation memory, which is what OOMs on long edits.
-#
-# Attention output rows are independent (each query row softmaxes over the full
-# key/value context), so splitting the *query* dimension into blocks is
-# numerically identical to one full-length call -- the same technique already
-# used for MPS varlen in runtime/layers/attention/backends/sdpa.py. It is gated
-# behind a trigger length so short (text-to-image) sequences keep taking the
-# single byte-identical call; only long sequences that would otherwise OOM are
-# chunked. Tune/disable via the env vars below.
-_ATTN_CHUNK_TRIGGER_LEN = int(os.getenv("SGLANG_H3_ATTN_CHUNK_TRIGGER_LEN", "6144"))
-_ATTN_QUERY_CHUNK_SIZE = int(os.getenv("SGLANG_H3_ATTN_QUERY_CHUNK_SIZE", "1024"))
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 class ImageKVCacheManager:
-    """Full attention over the text+image sequence (no KV caching).
-
-    Packed ``[tokens, heads, dim]`` inputs, 4-D bool mask. GQA KV heads are
-    broadcast natively by SDPA (``enable_gqa``) instead of materializing
-    repeated KV heads.
+    """Full attention over the text+image sequence (no KV caching); packed
+    ``[tokens, heads, dim]`` inputs, 4-D bool mask.
     """
 
-    def __call__(self, query, key, value, attention_mask=None):
-        bs, _, q_len, _ = attention_mask.shape
+    def __call__(self, query, key, value, attn_metadata, attention_mask=None):
         total_tokens = query.shape[0]
+        bs = len(attn_metadata.query_lens)
+        q_len = total_tokens // bs
+
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
+        repeat_num = head_num_per_rank // kv_head_num_per_rank
         head_dim = query.shape[2]
 
-        query = query.reshape(bs, q_len, head_num_per_rank, head_dim).transpose(1, 2).contiguous()
-        key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim).transpose(1, 2).contiguous()
-        value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim).transpose(1, 2).contiguous()
+        query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
+        key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
+        value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
 
-        scale = head_dim ** -0.5
-        use_chunking = (
-            _ATTN_QUERY_CHUNK_SIZE > 0
-            and q_len > _ATTN_CHUNK_TRIGGER_LEN
-            and q_len > _ATTN_QUERY_CHUNK_SIZE
+        query = query.transpose(1, 2).contiguous()
+        key = key.transpose(1, 2).contiguous()
+        value = value.transpose(1, 2).contiguous()
+
+        key = repeat_kv(key, repeat_num)
+        value = repeat_kv(value, repeat_num)
+
+        attn_output = F.scaled_dot_product_attention(
+            query, key, value,
+            attn_mask=attention_mask.contiguous(),
+            dropout_p=0.0,
+            is_causal=False,
+            scale=1.0 / (query.shape[-1] ** 0.5),
         )
-        if use_chunking:
-            # Bound peak SDPA memory on long TI2I (image-editing) sequences: each
-            # query block still attends over the full K/V context and its own mask
-            # rows, so the result is identical to a single full-length call.
-            out_chunks = []
-            for start in range(0, q_len, _ATTN_QUERY_CHUNK_SIZE):
-                stop = min(start + _ATTN_QUERY_CHUNK_SIZE, q_len)
-                out_chunks.append(
-                    F.scaled_dot_product_attention(
-                        query[:, :, start:stop, :].contiguous(),
-                        key,
-                        value,
-                        attn_mask=attention_mask[:, :, start:stop, :].contiguous(),
-                        enable_gqa=True,
-                        scale=scale,
-                    )
-                )
-            attn_output = torch.cat(out_chunks, dim=2)
-            del out_chunks
-        else:
-            attn_output = F.scaled_dot_product_attention(
-                query, key, value,
-                attn_mask=attention_mask,
-                enable_gqa=True,
-                scale=scale,
-            )
+
         attn_output = attn_output.transpose(1, 2).contiguous()
-        return attn_output.reshape(total_tokens, head_num_per_rank, head_dim)
+        attn_output = attn_output.reshape(total_tokens, head_num_per_rank, head_dim)
+        return attn_output
