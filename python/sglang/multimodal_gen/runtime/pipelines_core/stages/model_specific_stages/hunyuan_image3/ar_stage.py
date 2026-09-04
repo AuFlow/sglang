@@ -799,7 +799,16 @@ class HunyuanImage3AR(PipelineStage):
         gen_config = self._generation_config()
         tokenizer_kwargs: dict[str, Any] = dict(
             batch_prompt=[req.prompt for req in reqs],
+            # Match the reference stage's call exactly:
+            # - mode="gen_image" is required: the default "gen_text" omits the
+            #   gen_image assistant message and leaves gen_image_mask / gen
+            #   slices unset (the reduced tokenizer had no mode param).
+            # - bot_task / drop_think drive template selection and think-token
+            #   handling, sourced the same way as the reference stage.
+            mode="gen_image",
+            bot_task=tokenizer_bot_task,
             sequence_template=gen_config.get("sequence_template", "pretrain"),
+            drop_think=gen_config.get("drop_think", False),
             cfg_factor=cfg_factor,
         )
         resolved_prompt = resolve_system_prompt(
