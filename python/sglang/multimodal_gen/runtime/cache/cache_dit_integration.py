@@ -39,6 +39,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_gro
 _original_similarity = None
 
 
+def _all_reduce_mean_pair(first, second, group):
+    """Average two scalar statistics with one distributed collective."""
+    stats = torch.stack((first, second))
+    dist.all_reduce(stats, op=dist.ReduceOp.AVG, group=group)
+    return stats[0], stats[1]
+
+
 def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Module:
     """Remove Cache-DiT hooks so subsequent requests use the native forward."""
 
@@ -103,14 +110,15 @@ def _patch_cache_dit_similarity():
                 mean_diff = raw_diff[condition].mean()
                 mean_t1 = t1[condition].abs().mean()
             else:
-                mean_diff = (t1 - t2).abs().mean()
+                mean_diff = raw_diff.mean()
                 mean_t1 = t1.abs().mean()
         else:
             mean_diff = (t1 - t2).abs().mean()
             mean_t1 = t1.abs().mean()
 
-        dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
-        dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
+        mean_diff, mean_t1 = _all_reduce_mean_pair(
+            mean_diff, mean_t1, target_group
+        )
 
         diff = (mean_diff / mean_t1).item()
         self.add_residual_diff(diff)
@@ -497,6 +505,12 @@ class CacheDitController:
             self.unmount()
             return
 
+        # Warmup must always exercise the native model path.  In particular,
+        # unmount an adapter left active by an earlier request before returning.
+        if getattr(batch, "is_warmup", False):
+            self.unmount()
+            return
+
         self.request_overrides = resolve_cache_dit_request_overrides(
             getattr(sampling_params, "cache_dit_params", None)
         )
@@ -506,8 +520,6 @@ class CacheDitController:
         if self.enabled and desired_key != self.active_key:
             self.unmount()
         if not requested:
-            return
-        if getattr(batch, "is_warmup", False):
             return
 
         config = self._build_config(int(num_inference_steps))

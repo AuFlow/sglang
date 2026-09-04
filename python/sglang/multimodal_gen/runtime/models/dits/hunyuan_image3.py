@@ -1108,6 +1108,15 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             raise ValueError(
                 "num_image_tokens is required for HunyuanImage-3 forward_block."
             )
+        if not hasattr(self, "_sglang_cache_dit_adapter"):
+            return self.model.forward_block(
+                hidden_states,
+                attention_mask,
+                custom_pos_emb,
+                num_image_tokens=num_image_tokens,
+                first_step=first_step,
+            )
+
         attn_meta = create_hunyuan_image_attention_meta(
             attention_mask, num_image_tokens, first_step
         )

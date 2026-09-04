@@ -160,11 +160,20 @@ def _install_torch_stub():
     class _FakeReduceOp:
         AVG = "AVG"
 
+    torch_dist.all_reduce_calls = []
+
+    def all_reduce(tensor, *, op, group):
+        torch_dist.all_reduce_calls.append(
+            {"tensor": tensor, "op": op, "group": group}
+        )
+
     torch_nn.Module = _FakeModule
     torch_dist.ProcessGroup = _FakeProcessGroup
     torch_dist.ReduceOp = _FakeReduceOp
+    torch_dist.all_reduce = all_reduce
     torch.distributed = torch_dist
     torch.nn = torch_nn
+    torch.stack = lambda tensors: list(tensors)
 
     return {
         "torch": torch,
@@ -191,6 +200,26 @@ def _import_module_with_stub():
         assert spec.loader is not None
         spec.loader.exec_module(module)
     return module
+
+
+class TestCacheDitParallelSimilarity(unittest.TestCase):
+    def test_reduces_similarity_statistics_in_one_collective(self):
+        module = _import_module_with_stub()
+        group = object()
+
+        mean_diff, mean_t1 = module._all_reduce_mean_pair(0.25, 2.0, group)
+
+        self.assertEqual((mean_diff, mean_t1), (0.25, 2.0))
+        self.assertEqual(
+            module.dist.all_reduce_calls,
+            [
+                {
+                    "tensor": [0.25, 2.0],
+                    "op": "AVG",
+                    "group": group,
+                }
+            ],
+        )
 
 
 class TestCacheDitRefreshContext(unittest.TestCase):
@@ -376,6 +405,37 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
 
 
 class TestCacheDitController(unittest.TestCase):
+    def test_warmup_unmounts_cache_from_previous_request(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+        transformer = _make_transformer("HunyuanImage3ForCausalMM")
+        transformer.transformer_blocks = ["block_0"]
+        server_args = types.SimpleNamespace(enable_breakable_cuda_graph=False)
+        enabled_params = types.SimpleNamespace(
+            enable_cache_dit=True, cache_dit_params=None
+        )
+        controller = module.CacheDitController(transformer, server_args)
+
+        controller.configure(
+            12,
+            types.SimpleNamespace(
+                sampling_params=enabled_params,
+                is_warmup=False,
+            ),
+        )
+        controller.configure(
+            12,
+            types.SimpleNamespace(
+                sampling_params=enabled_params,
+                is_warmup=True,
+            ),
+        )
+
+        self.assertFalse(controller.enabled)
+        self.assertIsNone(controller.active_key)
+        self.assertEqual(len(module.cache_dit.disable_calls), 1)
+        self.assertEqual(module.cache_dit.refresh_calls, [])
+
     def test_mount_refresh_and_request_opt_out(self):
         module = _import_module_with_stub()
         module.BlockAdapterRegister.supported = False
