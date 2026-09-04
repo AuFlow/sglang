@@ -49,6 +49,25 @@ class HunyuanImage3PipelineConfig(SpatialImagePipelineConfig):
     def supports_native_grouped_requests(self):
         return True
 
+    def calculate_condition_image_size(self, image, width, height):
+        """Let the native processor choose the conditional-image bucket.
+
+        ``InputValidationStage`` normally resizes image-to-image inputs and
+        snaps the output canvas to a generic ``2 * vae_scale`` grid.  That is
+        not valid for HunyuanImage-3: its processor derives independent VAE
+        and vision inputs from the original image and accepts a 16-pixel
+        output grid.  Applying the generic resize first can therefore alter a
+        requested or reference aspect ratio before the native processor sees
+        it.
+        """
+        del image, width, height
+        return None
+
+    def prepare_calculated_size(self, image):
+        """Keep HunyuanImage-3 output resolution under native AR-stage control."""
+        del image
+        return None
+
     def supports_batching_image_conditioning(self):
         # TI2I requests carry per-request conditioning (per-row masks/scatter/
         # RoPE); requests are bucketed by resolution and condition-image count.

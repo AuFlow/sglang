@@ -76,6 +76,25 @@ def _cond_image_to_pil(raw_img):
         return None
 
 
+def resolve_hunyuan_image3_output_resolution(
+    width: int,
+    height: int,
+    explicit_fields: set[str],
+    reference_size: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    """Resolve the native AR canvas before the processor selects its bucket.
+
+    Explicit output dimensions always take precedence.  For image editing
+    without an explicit output size, use the unmodified reference image as
+    the target canvas so the generic image pipeline default (1280x720) cannot
+    turn a portrait edit into a landscape result.  The processor remains
+    authoritative for the final supported resolution.
+    """
+    if reference_size is not None and not {"width", "height"} & explicit_fields:
+        width, height = reference_size
+    return align_hunyuan_image3_resolution(width, height)
+
+
 def _vae_downsample_factors(config: Any) -> tuple[int, int]:
     vae_factor = getattr(config, "vae_downsample_factor", [16, 16])
     if isinstance(vae_factor, (list, tuple)):
@@ -942,20 +961,23 @@ class HunyuanImage3AR(PipelineStage):
 
     @staticmethod
     def _effective_resolution(req: Req, raw_cond_images) -> tuple[int, int]:
-        # TI2I inherits the reference size unless the user set width/height.
+        # Use the input-validation snapshot, not condition_image, because the
+        # latter can have passed through generic preprocessing in older flows.
         user_explicit_fields = getattr(
             req.sampling_params, "_explicit_fields", set()
         )
-        first_cond_pil = (
-            _cond_image_to_pil(raw_cond_images[0]) if raw_cond_images else None
+        reference_size = getattr(req, "original_condition_image_size", None)
+        if reference_size is None and raw_cond_images:
+            first_cond_pil = _cond_image_to_pil(raw_cond_images[0])
+            reference_size = (
+                first_cond_pil.size if first_cond_pil is not None else None
+            )
+        return resolve_hunyuan_image3_output_resolution(
+            req.width,
+            req.height,
+            user_explicit_fields,
+            reference_size,
         )
-        if (
-            first_cond_pil is not None
-            and "width" not in user_explicit_fields
-            and "height" not in user_explicit_fields
-        ):
-            return align_hunyuan_image3_resolution(*first_cond_pil.size)
-        return align_hunyuan_image3_resolution(req.width, req.height)
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
