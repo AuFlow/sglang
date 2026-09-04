@@ -376,6 +376,37 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
 
 
 class TestCacheDitController(unittest.TestCase):
+    def test_warmup_unmounts_cache_from_previous_request(self):
+        module = _import_module_with_stub()
+        module.BlockAdapterRegister.supported = False
+        transformer = _make_transformer("HunyuanImage3ForCausalMM")
+        transformer.transformer_blocks = ["block_0"]
+        server_args = types.SimpleNamespace(enable_breakable_cuda_graph=False)
+        enabled_params = types.SimpleNamespace(
+            enable_cache_dit=True, cache_dit_params=None
+        )
+        controller = module.CacheDitController(transformer, server_args)
+
+        controller.configure(
+            12,
+            types.SimpleNamespace(
+                sampling_params=enabled_params,
+                is_warmup=False,
+            ),
+        )
+        controller.configure(
+            12,
+            types.SimpleNamespace(
+                sampling_params=enabled_params,
+                is_warmup=True,
+            ),
+        )
+
+        self.assertFalse(controller.enabled)
+        self.assertIsNone(controller.active_key)
+        self.assertEqual(len(module.cache_dit.disable_calls), 1)
+        self.assertEqual(module.cache_dit.refresh_calls, [])
+
     def test_mount_refresh_and_request_opt_out(self):
         module = _import_module_with_stub()
         module.BlockAdapterRegister.supported = False

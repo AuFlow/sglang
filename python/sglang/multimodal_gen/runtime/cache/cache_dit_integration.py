@@ -497,6 +497,12 @@ class CacheDitController:
             self.unmount()
             return
 
+        # Warmup must always exercise the native model path.  In particular,
+        # unmount an adapter left active by an earlier request before returning.
+        if getattr(batch, "is_warmup", False):
+            self.unmount()
+            return
+
         self.request_overrides = resolve_cache_dit_request_overrides(
             getattr(sampling_params, "cache_dit_params", None)
         )
@@ -506,8 +512,6 @@ class CacheDitController:
         if self.enabled and desired_key != self.active_key:
             self.unmount()
         if not requested:
-            return
-        if getattr(batch, "is_warmup", False):
             return
 
         config = self._build_config(int(num_inference_steps))
