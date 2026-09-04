@@ -110,7 +110,7 @@ def _patch_cache_dit_similarity():
                 mean_diff = raw_diff[condition].mean()
                 mean_t1 = t1[condition].abs().mean()
             else:
-                mean_diff = (t1 - t2).abs().mean()
+                mean_diff = raw_diff.mean()
                 mean_t1 = t1.abs().mean()
         else:
             mean_diff = (t1 - t2).abs().mean()
