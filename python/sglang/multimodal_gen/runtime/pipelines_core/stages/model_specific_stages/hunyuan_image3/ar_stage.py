@@ -758,16 +758,24 @@ class HunyuanImage3AR(PipelineStage):
 
     def _scatter_cond_vit_tokens_batched(
         self, hidden_states, per_request_vit_embeds, cond_vit_slices_rows,
+        n_req, do_cfg,
     ):
+        # The uncond half of the CFG-packed sequence keeps the cond (joint)
+        # image sections (only the text is replaced with <cfg> tokens), so the
+        # ViT embeddings must be scattered into those rows too -- matching the
+        # reference, which repeats the cond tensors cfg_factor times.
         for r, embeds in enumerate(per_request_vit_embeds):
-            for i, embed in enumerate(embeds):
-                s = cond_vit_slices_rows[r][i]
-                positions = torch.arange(
-                    s.start, s.stop, device=hidden_states.device
-                )
-                hidden_states[r, positions] = embed[: s.stop - s.start].to(
-                    hidden_states.dtype
-                )
+            if not embeds:
+                continue
+            target_rows = [r] + ([n_req + r] if do_cfg else [])
+            for row in target_rows:
+                for i, s in enumerate(cond_vit_slices_rows[row]):
+                    positions = torch.arange(
+                        s.start, s.stop, device=hidden_states.device
+                    )
+                    hidden_states[row, positions] = embeds[i][
+                        : s.stop - s.start
+                    ].to(hidden_states.dtype)
         return hidden_states
 
     @staticmethod
@@ -1149,7 +1157,7 @@ class HunyuanImage3AR(PipelineStage):
                     )
                     hidden_states = self._scatter_cond_vit_tokens_batched(
                         hidden_states, per_request_vit_embeds,
-                        cond_vit_slices_rows,
+                        cond_vit_slices_rows, n_req, do_cfg,
                     )
                     if cond_timestep_scatter_index is not None:
                         all_cond_t = torch.cat(per_request_t, dim=0).repeat(cfg_factor)
