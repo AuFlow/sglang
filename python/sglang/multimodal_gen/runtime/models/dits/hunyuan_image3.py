@@ -1212,8 +1212,13 @@ class _Hi3CacheBlock(nn.Module):
         object.__setattr__(self, "_layer", layer)
 
     def forward(self, hidden_states, attention_mask, custom_pos_emb):
+        # The restored pre-compact attention contract dispatches on attn_meta,
+        # which Model.forward_block always builds via the factory. This adapter
+        # was added after that threading was removed, so it builds the metadata
+        # itself (ImageKVCacheManager only reads query_lens from it).
+        attn_meta = create_hunyuan_image_attention_meta(attention_mask, None, False)
         hidden_states, _, _ = self._layer(
-            None, hidden_states, None, None, None, None, attention_mask, custom_pos_emb,
+            None, hidden_states, None, None, None, attn_meta, attention_mask, custom_pos_emb,
         )
         return hidden_states
 
