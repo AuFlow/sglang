@@ -227,54 +227,56 @@ _ATTN_CHUNK_TRIGGER_LEN = int(os.getenv("SGLANG_H3_ATTN_CHUNK_TRIGGER_LEN", "614
 _ATTN_QUERY_CHUNK_SIZE = int(os.getenv("SGLANG_H3_ATTN_QUERY_CHUNK_SIZE", "1024"))
 
 
-def image_attention(query, key, value, attention_mask):
-    """Masked full-sequence attention for the diffusion loop (no KV cache).
+class ImageKVCacheManager:
+    """Full attention over the text+image sequence (no KV caching).
 
     Packed ``[tokens, heads, dim]`` inputs, 4-D bool mask. GQA KV heads are
     broadcast natively by SDPA (``enable_gqa``) instead of materializing
     repeated KV heads.
     """
-    bs, _, q_len, _ = attention_mask.shape
-    total_tokens = query.shape[0]
-    head_num_per_rank = query.shape[1]
-    kv_head_num_per_rank = key.shape[1]
-    head_dim = query.shape[2]
 
-    query = query.reshape(bs, q_len, head_num_per_rank, head_dim).transpose(1, 2).contiguous()
-    key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim).transpose(1, 2).contiguous()
-    value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim).transpose(1, 2).contiguous()
+    def __call__(self, query, key, value, attention_mask=None):
+        bs, _, q_len, _ = attention_mask.shape
+        total_tokens = query.shape[0]
+        head_num_per_rank = query.shape[1]
+        kv_head_num_per_rank = key.shape[1]
+        head_dim = query.shape[2]
 
-    scale = head_dim ** -0.5
-    use_chunking = (
-        _ATTN_QUERY_CHUNK_SIZE > 0
-        and q_len > _ATTN_CHUNK_TRIGGER_LEN
-        and q_len > _ATTN_QUERY_CHUNK_SIZE
-    )
-    if use_chunking:
-        # Bound peak SDPA memory on long TI2I (image-editing) sequences: each
-        # query block still attends over the full K/V context and its own mask
-        # rows, so the result is identical to a single full-length call.
-        out_chunks = []
-        for start in range(0, q_len, _ATTN_QUERY_CHUNK_SIZE):
-            stop = min(start + _ATTN_QUERY_CHUNK_SIZE, q_len)
-            out_chunks.append(
-                F.scaled_dot_product_attention(
-                    query[:, :, start:stop, :].contiguous(),
-                    key,
-                    value,
-                    attn_mask=attention_mask[:, :, start:stop, :].contiguous(),
-                    enable_gqa=True,
-                    scale=scale,
-                )
-            )
-        attn_output = torch.cat(out_chunks, dim=2)
-        del out_chunks
-    else:
-        attn_output = F.scaled_dot_product_attention(
-            query, key, value,
-            attn_mask=attention_mask,
-            enable_gqa=True,
-            scale=scale,
+        query = query.reshape(bs, q_len, head_num_per_rank, head_dim).transpose(1, 2).contiguous()
+        key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim).transpose(1, 2).contiguous()
+        value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim).transpose(1, 2).contiguous()
+
+        scale = head_dim ** -0.5
+        use_chunking = (
+            _ATTN_QUERY_CHUNK_SIZE > 0
+            and q_len > _ATTN_CHUNK_TRIGGER_LEN
+            and q_len > _ATTN_QUERY_CHUNK_SIZE
         )
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output.reshape(total_tokens, head_num_per_rank, head_dim)
+        if use_chunking:
+            # Bound peak SDPA memory on long TI2I (image-editing) sequences: each
+            # query block still attends over the full K/V context and its own mask
+            # rows, so the result is identical to a single full-length call.
+            out_chunks = []
+            for start in range(0, q_len, _ATTN_QUERY_CHUNK_SIZE):
+                stop = min(start + _ATTN_QUERY_CHUNK_SIZE, q_len)
+                out_chunks.append(
+                    F.scaled_dot_product_attention(
+                        query[:, :, start:stop, :].contiguous(),
+                        key,
+                        value,
+                        attn_mask=attention_mask[:, :, start:stop, :].contiguous(),
+                        enable_gqa=True,
+                        scale=scale,
+                    )
+                )
+            attn_output = torch.cat(out_chunks, dim=2)
+            del out_chunks
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                query, key, value,
+                attn_mask=attention_mask,
+                enable_gqa=True,
+                scale=scale,
+            )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output.reshape(total_tokens, head_num_per_rank, head_dim)
