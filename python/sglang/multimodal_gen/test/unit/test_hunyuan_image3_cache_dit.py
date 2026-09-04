@@ -33,6 +33,61 @@ class _MountedCacheDitBlocks(nn.Module):
         return hidden_states + 1
 
 
+class _NativeBackbone:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def forward_block(
+        self,
+        hidden_states,
+        attention_mask,
+        custom_pos_emb,
+        *,
+        num_image_tokens,
+        first_step,
+    ):
+        self.calls.append(
+            {
+                "attention_mask": attention_mask,
+                "custom_pos_emb": custom_pos_emb,
+                "num_image_tokens": num_image_tokens,
+                "first_step": first_step,
+            }
+        )
+        return hidden_states + 2
+
+
+def test_forward_uses_native_backbone_when_cache_dit_is_disabled():
+    model = hunyuan_image3.HunyuanImage3ForCausalMM.__new__(
+        hunyuan_image3.HunyuanImage3ForCausalMM
+    )
+    nn.Module.__init__(model)
+    native_backbone = _NativeBackbone()
+    model.model = native_backbone
+
+    hidden_states = torch.zeros(3, 4)
+    attention_mask = torch.ones(1, 1, 3, 3, dtype=torch.bool)
+    cos = torch.zeros(1, 3, 2)
+    sin = torch.ones(1, 3, 2)
+
+    output = model.forward(
+        hidden_states,
+        attention_mask=attention_mask,
+        custom_pos_emb=(cos, sin),
+        num_image_tokens=2,
+        first_step=True,
+    )
+
+    assert torch.equal(output, hidden_states + 2)
+    assert len(native_backbone.calls) == 1
+    call = native_backbone.calls[0]
+    assert call["attention_mask"] is attention_mask
+    assert call["custom_pos_emb"][0] is cos
+    assert call["custom_pos_emb"][1] is sin
+    assert call["num_image_tokens"] == 2
+    assert call["first_step"] is True
+
+
 def test_forward_executes_cache_dit_mounted_blocks(monkeypatch):
     """The native forward accepts cache-dit's temporary block replacement."""
     model = hunyuan_image3.HunyuanImage3ForCausalMM.__new__(
@@ -45,6 +100,7 @@ def test_forward_executes_cache_dit_mounted_blocks(monkeypatch):
     # Cache-DiT temporarily replaces `transformer_blocks` with exactly this
     # shape: a ModuleList containing one CachedBlocks_Pattern_3_4_5 wrapper.
     model.transformer_blocks = nn.ModuleList([mounted_blocks])
+    model._sglang_cache_dit_adapter = object()
 
     attention_meta = object()
     monkeypatch.setattr(
