@@ -160,11 +160,20 @@ def _install_torch_stub():
     class _FakeReduceOp:
         AVG = "AVG"
 
+    torch_dist.all_reduce_calls = []
+
+    def all_reduce(tensor, *, op, group):
+        torch_dist.all_reduce_calls.append(
+            {"tensor": tensor, "op": op, "group": group}
+        )
+
     torch_nn.Module = _FakeModule
     torch_dist.ProcessGroup = _FakeProcessGroup
     torch_dist.ReduceOp = _FakeReduceOp
+    torch_dist.all_reduce = all_reduce
     torch.distributed = torch_dist
     torch.nn = torch_nn
+    torch.stack = lambda tensors: list(tensors)
 
     return {
         "torch": torch,
@@ -191,6 +200,26 @@ def _import_module_with_stub():
         assert spec.loader is not None
         spec.loader.exec_module(module)
     return module
+
+
+class TestCacheDitParallelSimilarity(unittest.TestCase):
+    def test_reduces_similarity_statistics_in_one_collective(self):
+        module = _import_module_with_stub()
+        group = object()
+
+        mean_diff, mean_t1 = module._all_reduce_mean_pair(0.25, 2.0, group)
+
+        self.assertEqual((mean_diff, mean_t1), (0.25, 2.0))
+        self.assertEqual(
+            module.dist.all_reduce_calls,
+            [
+                {
+                    "tensor": [0.25, 2.0],
+                    "op": "AVG",
+                    "group": group,
+                }
+            ],
+        )
 
 
 class TestCacheDitRefreshContext(unittest.TestCase):
