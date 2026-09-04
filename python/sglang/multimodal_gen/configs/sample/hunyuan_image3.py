@@ -7,11 +7,24 @@ logger = init_logger(__name__)
 
 HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT = 16
 
-VALID_BOT_TASKS = {"auto", "image", "think", "recaption", "think_recaption", "img_ratio", "none"}
+VALID_BOT_TASKS = {
+    "auto",
+    "image",
+    "think",
+    "recaption",
+    "think_recaption",
+    "img_ratio",
+    "none",
+}
 
 SYSTEM_PROMPT_PRESETS = {
-    "none", "en_unified", "en_vanilla", "en_recaption",
-    "en_think_recaption", "dynamic", "auto",
+    "none",
+    "en_unified",
+    "en_vanilla",
+    "en_recaption",
+    "en_think_recaption",
+    "dynamic",
+    "auto",
 }
 
 
@@ -46,25 +59,8 @@ class HunyuanImage3SamplingParams(SamplingParams):
     )
 
     def _adjust(self, server_args):
-        requested_width = self.width
-        requested_height = self.height
-        if self.width is not None and self.height is not None:
-            self.width, self.height = align_hunyuan_image3_resolution(
-                self.width, self.height
-            )
-            if (self.width, self.height) != (
-                requested_width,
-                requested_height,
-            ):
-                logger.warning(
-                    "HunyuanImage-3 requires dimensions divisible by %s; adjusted "
-                    "requested resolution from %sx%s to %sx%s",
-                    HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT,
-                    requested_width,
-                    requested_height,
-                    self.width,
-                    self.height,
-                )
+        # The processor's get_target_size() picks the bucket by aspect ratio;
+        # pre-aligning each dimension to a 16-px grid here would distort it.
         if self.bot_task not in VALID_BOT_TASKS:
             logger.warning(
                 f"Invalid bot_task '{self.bot_task}'. Must be one of {VALID_BOT_TASKS}. "

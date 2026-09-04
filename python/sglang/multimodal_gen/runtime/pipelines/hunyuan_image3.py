@@ -8,6 +8,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from transformers import AutoTokenizer
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
@@ -39,6 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3 import (
     HunyuanImage3AR,
+    HunyuanImage3DecodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -292,7 +294,9 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         vision_model = Siglip2VisionTransformer(vit_config)
 
         state_dict = self._collect_prefixed_weights(model_path, "vision_model.")
-        missing_keys, _unexpected = vision_model.load_state_dict(state_dict, strict=False)
+        missing_keys, _unexpected = vision_model.load_state_dict(
+            state_dict, strict=False
+        )
         if missing_keys:
             logger.warning(
                 "vision_model missing %d key(s), e.g. %s",
@@ -304,7 +308,9 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         vision_model.to(device=device)
         vision_model.eval()
         self.memory_usages["vision_model"] = _module_memory_gb(vision_model)
-        logger.info("Loaded vision_model (%.2f GiB)", self.memory_usages["vision_model"])
+        logger.info(
+            "Loaded vision_model (%.2f GiB)", self.memory_usages["vision_model"]
+        )
         return vision_model
 
     def _load_vision_aligner(
@@ -328,11 +334,15 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         vision_aligner.to(device=device)
         vision_aligner.eval()
         self.memory_usages["vision_aligner"] = _module_memory_gb(vision_aligner)
-        logger.info("Loaded vision_aligner (%.2f GiB)", self.memory_usages["vision_aligner"])
+        logger.info(
+            "Loaded vision_aligner (%.2f GiB)", self.memory_usages["vision_aligner"]
+        )
         return vision_aligner
 
     @staticmethod
-    def _collect_prefixed_weights(model_path: str, prefix: str) -> dict[str, torch.Tensor]:
+    def _collect_prefixed_weights(
+        model_path: str, prefix: str
+    ) -> dict[str, torch.Tensor]:
         index_path = os.path.join(model_path, "model.safetensors.index.json")
         with open(index_path) as f:
             weight_map = json.load(f)["weight_map"]
@@ -344,7 +354,7 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         state_dict: dict[str, torch.Tensor] = {}
         for name, tensor in safetensors_weights_iterator(shard_paths):
             if name.startswith(prefix):
-                state_dict[name[len(prefix):]] = tensor
+                state_dict[name[len(prefix) :]] = tensor
         return state_dict
 
     @staticmethod
@@ -368,7 +378,13 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             "hunyuan_image3_ar",
         )
 
-        self.add_standard_decoding_stage()
+        self.add_stage_factory(
+            RoleType.DECODER,
+            lambda: HunyuanImage3DecodingStage(
+                vae=self.get_module("vae"), pipeline=self
+            ),
+            "decoding_stage",
+        )
 
     def forward_batch(self, batches, server_args: ServerArgs):
         if len(batches) > 1 and self.executor.component_residency_manager is None:
