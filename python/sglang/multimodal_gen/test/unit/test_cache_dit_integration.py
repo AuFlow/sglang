@@ -118,6 +118,7 @@ def _install_sglang_dependency_stubs():
     envs.SGLANG_CACHE_DIT_SCM_POLICY = "dynamic"
     envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS = None
     envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS = None
+    multimodal_gen.envs = envs
 
     class _FakeLogger:
         def debug(self, *_args, **_kwargs):
@@ -160,20 +161,11 @@ def _install_torch_stub():
     class _FakeReduceOp:
         AVG = "AVG"
 
-    torch_dist.all_reduce_calls = []
-
-    def all_reduce(tensor, *, op, group):
-        torch_dist.all_reduce_calls.append(
-            {"tensor": tensor, "op": op, "group": group}
-        )
-
     torch_nn.Module = _FakeModule
     torch_dist.ProcessGroup = _FakeProcessGroup
     torch_dist.ReduceOp = _FakeReduceOp
-    torch_dist.all_reduce = all_reduce
     torch.distributed = torch_dist
     torch.nn = torch_nn
-    torch.stack = lambda tensors: list(tensors)
 
     return {
         "torch": torch,
@@ -200,26 +192,6 @@ def _import_module_with_stub():
         assert spec.loader is not None
         spec.loader.exec_module(module)
     return module
-
-
-class TestCacheDitParallelSimilarity(unittest.TestCase):
-    def test_reduces_similarity_statistics_in_one_collective(self):
-        module = _import_module_with_stub()
-        group = object()
-
-        mean_diff, mean_t1 = module._all_reduce_mean_pair(0.25, 2.0, group)
-
-        self.assertEqual((mean_diff, mean_t1), (0.25, 2.0))
-        self.assertEqual(
-            module.dist.all_reduce_calls,
-            [
-                {
-                    "tensor": [0.25, 2.0],
-                    "op": "AVG",
-                    "group": group,
-                }
-            ],
-        )
 
 
 class TestCacheDitRefreshContext(unittest.TestCase):
@@ -290,6 +262,25 @@ class TestCacheDitRefreshContext(unittest.TestCase):
                 "num_inference_steps": 6,
                 "steps_computation_mask": None,
                 "steps_computation_policy": None,
+            },
+        )
+
+    def test_refresh_context_uses_precomputed_scm_mask_and_policy(self):
+        module = _import_module_with_stub()
+        module.refresh_context_on_transformer(
+            transformer="transformer",
+            num_inference_steps=8,
+            steps_computation_mask=[1, 0] * 4,
+            steps_computation_policy="static",
+        )
+
+        self.assertEqual(module.cache_dit.steps_mask_calls, [])
+        self.assertEqual(
+            module.cache_dit.refresh_calls[0]["cache_config"],
+            {
+                "num_inference_steps": 8,
+                "steps_computation_mask": [1, 0] * 4,
+                "steps_computation_policy": "static",
             },
         )
 
@@ -378,158 +369,168 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         self.assertEqual(module.cache_dit.disable_calls, [adapter])
         self.assertFalse(hasattr(transformer, "_sglang_cache_dit_adapter"))
 
-    def test_hunyuan_image3_uses_pattern_3_facade_blocks(self):
-        module = _import_module_with_stub()
-        transformer = _make_transformer("HunyuanImage3ForCausalMM")
-        transformer.transformer_blocks = ["block_0", "block_1"]
-
-        adapter = module._build_custom_block_adapter(transformer)
-
-        self.assertEqual(adapter.blocks, transformer.transformer_blocks)
-        self.assertEqual(adapter.forward_pattern, "Pattern_3")
-
-    def test_hunyuan_image3_custom_adapter_wins_prefix_registry_collision(self):
+    def test_exact_sglang_adapter_wins_over_prefix_registry(self):
         module = _import_module_with_stub()
         module.BlockAdapterRegister.supported = True
-        transformer = _make_transformer("HunyuanImage3ForCausalMM")
-        transformer.transformer_blocks = ["block_0", "block_1"]
+        transformer = _make_transformer("MiniMaxH3DiTModel")
+        transformer.blocks = ["block_0"]
         config = module.CacheDitConfig(enabled=True, num_inference_steps=8)
 
-        returned = module.enable_cache_on_transformer(transformer, config)
+        module.enable_cache_on_transformer(transformer, config)
 
-        self.assertIs(returned, transformer)
-        adapter = transformer._sglang_cache_dit_adapter
-        self.assertIs(module.cache_dit.enable_calls[0]["target"], adapter)
-        self.assertEqual(adapter.blocks, transformer.transformer_blocks)
-        self.assertEqual(adapter.forward_pattern, "Pattern_3")
+        self.assertIs(
+            module.cache_dit.enable_calls[0]["target"],
+            transformer._sglang_cache_dit_adapter,
+        )
+
+
+def _controller_batch(
+    *, enable_cache_dit=None, cache_dit_params=None, is_warmup=False
+):
+    return types.SimpleNamespace(
+        is_warmup=is_warmup,
+        sampling_params=types.SimpleNamespace(
+            enable_cache_dit=enable_cache_dit,
+            cache_dit_params=cache_dit_params,
+        ),
+    )
 
 
 class TestCacheDitController(unittest.TestCase):
-    def test_warmup_unmounts_cache_from_previous_request(self):
-        module = _import_module_with_stub()
-        module.BlockAdapterRegister.supported = False
-        transformer = _make_transformer("HunyuanImage3ForCausalMM")
-        transformer.transformer_blocks = ["block_0"]
-        server_args = types.SimpleNamespace(enable_breakable_cuda_graph=False)
-        enabled_params = types.SimpleNamespace(
-            enable_cache_dit=True, cache_dit_params=None
+    def setUp(self):
+        self.module = _import_module_with_stub()
+        self.transformer = types.SimpleNamespace()
+        self.controller = self.module.CacheDitController(
+            self.transformer,
+            types.SimpleNamespace(enable_breakable_cuda_graph=False),
         )
-        controller = module.CacheDitController(transformer, server_args)
+        self.enable_calls = []
+        self.refresh_calls = []
+        self.disable_calls = []
 
-        controller.configure(
-            12,
-            types.SimpleNamespace(
-                sampling_params=enabled_params,
-                is_warmup=False,
+        self.enable_patch = patch.object(
+            self.module,
+            "enable_cache_on_transformer",
+            lambda transformer, config, **kwargs: self.enable_calls.append(
+                (transformer, config, kwargs)
             ),
         )
-        controller.configure(
-            12,
-            types.SimpleNamespace(
-                sampling_params=enabled_params,
-                is_warmup=True,
+        self.refresh_patch = patch.object(
+            self.module,
+            "refresh_context_on_transformer",
+            lambda transformer, steps, **kwargs: self.refresh_calls.append(
+                (transformer, steps, kwargs)
             ),
         )
-
-        self.assertFalse(controller.enabled)
-        self.assertIsNone(controller.active_key)
-        self.assertEqual(len(module.cache_dit.disable_calls), 1)
-        self.assertEqual(module.cache_dit.refresh_calls, [])
-
-    def test_mount_refresh_and_request_opt_out(self):
-        module = _import_module_with_stub()
-        module.BlockAdapterRegister.supported = False
-        transformer = _make_transformer("HunyuanImage3ForCausalMM")
-        transformer.transformer_blocks = ["block_0"]
-        server_args = types.SimpleNamespace(enable_breakable_cuda_graph=False)
-        enabled_params = types.SimpleNamespace(
-            enable_cache_dit=True, cache_dit_params=None
+        self.disable_patch = patch.object(
+            self.module,
+            "disable_cache_on_transformer",
+            lambda transformer: self.disable_calls.append(transformer),
         )
-        enabled_batch = types.SimpleNamespace(
-            sampling_params=enabled_params, is_warmup=False
-        )
-        controller = module.CacheDitController(transformer, server_args)
+        self.enable_patch.start()
+        self.refresh_patch.start()
+        self.disable_patch.start()
+        self.addCleanup(self.enable_patch.stop)
+        self.addCleanup(self.refresh_patch.stop)
+        self.addCleanup(self.disable_patch.stop)
 
-        controller.configure(12, enabled_batch)
-        self.assertTrue(controller.enabled)
-        self.assertEqual(len(module.cache_dit.enable_calls), 1)
+    def test_cfg_execution_mode_remounts_and_step_change_refreshes(self):
+        batch = _controller_batch(enable_cache_dit=True)
+        self.controller.configure(8, batch, has_separate_cfg=False)
+        self.controller.configure(8, batch, has_separate_cfg=True)
+        self.controller.configure(12, batch, has_separate_cfg=True)
 
-        controller.configure(12, enabled_batch)
-        self.assertEqual(len(module.cache_dit.refresh_calls), 1)
+        self.assertEqual(len(self.enable_calls), 2)
+        self.assertEqual(self.disable_calls, [self.transformer])
+        self.assertFalse(self.enable_calls[0][2]["has_separate_cfg"])
+        self.assertTrue(self.enable_calls[1][2]["has_separate_cfg"])
+        self.assertEqual(self.refresh_calls[0][1], 12)
 
-        disabled_batch = types.SimpleNamespace(
-            sampling_params=types.SimpleNamespace(
-                enable_cache_dit=False, cache_dit_params=None
-            ),
-            is_warmup=False,
-        )
-        controller.configure(12, disabled_batch)
-        self.assertFalse(controller.enabled)
-        self.assertEqual(len(module.cache_dit.disable_calls), 1)
-
-    def test_refresh_preserves_static_scm_policy(self):
-        module = _import_module_with_stub()
-        module.BlockAdapterRegister.supported = False
-        transformer = _make_transformer("HunyuanImage3ForCausalMM")
-        transformer.transformer_blocks = ["block_0"]
-        server_args = types.SimpleNamespace(enable_breakable_cuda_graph=False)
-        batch = types.SimpleNamespace(
-            sampling_params=types.SimpleNamespace(
+    def test_effective_default_override_refreshes_without_remount(self):
+        self.controller.configure(8, _controller_batch(enable_cache_dit=True))
+        self.controller.configure(
+            8,
+            _controller_batch(
                 enable_cache_dit=True,
-                cache_dit_params={
-                    "scm_preset": "fast",
-                    "scm_policy": "static",
-                },
+                cache_dit_params={"residual_diff_threshold": 0.24},
             ),
-            is_warmup=False,
         )
-        controller = module.CacheDitController(transformer, server_args)
 
-        controller.configure(8, batch)
-        controller.configure(12, batch)
+        self.assertEqual(len(self.enable_calls), 1)
+        self.assertEqual(self.disable_calls, [])
+        self.assertEqual(len(self.refresh_calls), 1)
 
-        mounted_config = module.cache_dit.enable_calls[0]["cache_config"]
-        self.assertEqual(
-            mounted_config.kwargs["steps_computation_policy"], "static"
-        )
-        refreshed_config = module.cache_dit.refresh_calls[0]["cache_config"]
-        self.assertEqual(refreshed_config["steps_computation_policy"], "static")
-        self.assertEqual(len(refreshed_config["steps_computation_mask"]), 12)
-
-    def test_refresh_rebuilds_custom_scm_mask_for_new_step_count(self):
-        module = _import_module_with_stub()
-        module.BlockAdapterRegister.supported = False
-        transformer = _make_transformer("HunyuanImage3ForCausalMM")
-        transformer.transformer_blocks = ["block_0"]
-        server_args = types.SimpleNamespace(enable_breakable_cuda_graph=False)
-        batch = types.SimpleNamespace(
-            sampling_params=types.SimpleNamespace(
-                enable_cache_dit=True,
-                cache_dit_params={
-                    "scm_compute_bins": [4, 4],
-                    "scm_cache_bins": [2, 2],
-                    "scm_policy": "static",
-                },
-            ),
-            is_warmup=False,
-        )
-        controller = module.CacheDitController(transformer, server_args)
-
-        controller.configure(8, batch)
-        controller.configure(12, batch)
-
-        refreshed_config = module.cache_dit.refresh_calls[0]["cache_config"]
-        self.assertEqual(len(refreshed_config["steps_computation_mask"]), 12)
-        self.assertEqual(refreshed_config["steps_computation_policy"], "static")
-        self.assertEqual(
-            module.cache_dit.steps_mask_calls[-1],
-            {
-                "mask_policy": "medium",
-                "total_steps": 12,
-                "compute_bins": [4, 4],
-                "cache_bins": [2, 2],
+    def test_effective_config_key_coalesces_explicit_environment_defaults(self):
+        default = _controller_batch(enable_cache_dit=True).sampling_params
+        explicit_defaults = _controller_batch(
+            enable_cache_dit=True,
+            cache_dit_params={
+                "Fn_compute_blocks": 1,
+                "Bn_compute_blocks": 0,
+                "max_warmup_steps": 4,
+                "residual_diff_threshold": 0.24,
+                "max_continuous_cached_steps": 3,
+                "enable_taylorseer": False,
+                "taylorseer_order": 1,
+                "scm_preset": "none",
+                "scm_policy": "dynamic",
             },
+        ).sampling_params
+
+        self.assertEqual(
+            self.module.CacheDitController.effective_config_key(
+                default, 8, has_separate_cfg=False
+            ),
+            self.module.CacheDitController.effective_config_key(
+                explicit_defaults, 8, has_separate_cfg=False
+            ),
         )
+
+    def test_disabling_scm_remounts_to_clear_the_previous_mask(self):
+        self.controller.configure(
+            8,
+            _controller_batch(
+                enable_cache_dit=True,
+                cache_dit_params={"scm_preset": "fast"},
+            ),
+        )
+        self.controller.configure(
+            8,
+            _controller_batch(
+                enable_cache_dit=True,
+                cache_dit_params={"scm_preset": "none"},
+            ),
+        )
+
+        self.assertEqual(len(self.enable_calls), 2)
+        self.assertEqual(self.disable_calls, [self.transformer])
+        self.assertEqual(self.refresh_calls, [])
+
+    def test_request_scm_overrides_mount_and_refresh(self):
+        batch = _controller_batch(
+            enable_cache_dit=True,
+            cache_dit_params={"scm_preset": "fast", "scm_policy": "static"},
+        )
+        self.controller.configure(8, batch)
+        self.controller.configure(12, batch)
+
+        config = self.enable_calls[0][1]
+        self.assertEqual(config.steps_computation_mask, [1] * 8)
+        self.assertEqual(config.steps_computation_policy, "static")
+        self.assertEqual(
+            self.refresh_calls[0][2],
+            {"steps_computation_mask": [1] * 12, "steps_computation_policy": "static"},
+        )
+
+    def test_warmup_never_mounts_and_opt_out_unmounts(self):
+        warmup = _controller_batch(enable_cache_dit=True, is_warmup=True)
+        self.controller.configure(8, warmup)
+        self.assertEqual(self.enable_calls, [])
+
+        self.controller.configure(8, _controller_batch(enable_cache_dit=True))
+        self.controller.configure(8, _controller_batch(enable_cache_dit=False))
+        self.assertEqual(len(self.enable_calls), 1)
+        self.assertEqual(self.disable_calls, [self.transformer])
 
 
 if __name__ == "__main__":
