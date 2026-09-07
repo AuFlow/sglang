@@ -7,8 +7,11 @@ from typing import Any
 import torch
 from PIL import Image as PILImage
 
-from sglang.multimodal_gen.configs.sample.hunyuan_image3 import (
-    align_hunyuan_image3_resolution,
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+    CacheDitConfig,
+    enable_cache_on_transformer,
+    refresh_context_on_transformer,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -19,28 +22,26 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.models.dits.hunyuan_image3 import (
+    Hi3CacheBlockAdapter,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import load_dict
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image
 
-from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
-    CacheDitConfig,
-    enable_cache_on_transformer,
-    refresh_context_on_transformer,
-)
-from sglang.multimodal_gen.runtime.models.dits.hunyuan_image3 import (
-    Hi3CacheBlockAdapter,
-)
-
 from .prompts import resolve_system_prompt
+from .resolution import (
+    OUTPUT_GEOMETRY_EXTRA_KEY,
+    build_hunyuan_image3_output_geometry,
+    resolve_hunyuan_image3_output_resolution,
+)
 from .tokenizer import (
     HunyuanImage3TokenizerWrapper,
     ImageInfo,
@@ -50,20 +51,13 @@ from .tokenizer import (
 
 logger = init_logger(__name__)
 
+
 def _is_oom_error(exc: BaseException) -> bool:
     """True for a device OOM: torch.OutOfMemoryError, or the RuntimeError that
     some backends raise carrying an 'out of memory' message."""
     if isinstance(exc, torch.OutOfMemoryError):
         return True
     return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
-
-
-def _empty_device_cache() -> None:
-    """empty_cache() on the active device module; a no-op for backends whose
-    module (e.g. torch.cpu) exposes no cache to empty."""
-    empty_cache = getattr(torch.get_device_module(), "empty_cache", None)
-    if empty_cache is not None:
-        empty_cache()
 
 
 def _seed_for_output(seed, output_idx: int):
@@ -208,7 +202,6 @@ class HunyuanImage3AR(PipelineStage):
         model_path: str,
         vision_model,
         vision_aligner,
-        max_cond_encode_chunk: int | None = None,
     ):
         super().__init__()
         self.ar_model = ar_model
@@ -218,10 +211,6 @@ class HunyuanImage3AR(PipelineStage):
         self._model_path = model_path
         self._vision_model = vision_model
         self._vision_aligner = vision_aligner
-        # Initial cap for the cond-encode chunk, derived from the scheduler's
-        # --batching-max-size: an operator raising it declares the device can
-        # take grouped work; None (or 1) leaves the chunk unlimited.
-        self._max_cond_encode_chunk = max_cond_encode_chunk
         self._custom_tokenizer = HunyuanImage3TokenizerWrapper(tokenizer)
         self._gen_config_cache: dict | None = None
         self._cache_dit_adapter = None
@@ -298,9 +287,12 @@ class HunyuanImage3AR(PipelineStage):
             self.log_info(
                 "cache-dit enabled on HunyuanImage-3 (Fn=%d Bn=%d W=%d R=%.2f "
                 "MC=%d TaylorSeer=%s)",
-                envs.SGLANG_CACHE_DIT_FN, envs.SGLANG_CACHE_DIT_BN,
-                envs.SGLANG_CACHE_DIT_WARMUP, envs.SGLANG_CACHE_DIT_RDT,
-                envs.SGLANG_CACHE_DIT_MC, envs.SGLANG_CACHE_DIT_TAYLORSEER,
+                envs.SGLANG_CACHE_DIT_FN,
+                envs.SGLANG_CACHE_DIT_BN,
+                envs.SGLANG_CACHE_DIT_WARMUP,
+                envs.SGLANG_CACHE_DIT_RDT,
+                envs.SGLANG_CACHE_DIT_MC,
+                envs.SGLANG_CACHE_DIT_TAYLORSEER,
             )
         # Refresh every batch: a new generation resets cache-dit's step counter.
         refresh_context_on_transformer(self._cache_dit_adapter, num_inference_steps)
@@ -322,13 +314,14 @@ class HunyuanImage3AR(PipelineStage):
         cos = cos.contiguous()
         sin = sin.contiguous()
 
-        # hidden_states changes on every denoising step, so keep its TP
-        # synchronization in the per-step path. Request-static attention
-        # inputs are synchronized once before the loop.
+        # Broadcast from rank 0 for deterministic TP collectives
         if model_parallel_is_initialized():
             tp_group = get_tp_group()
             if tp_group.world_size > 1:
                 hidden_states = tp_group.broadcast(hidden_states, src=0)
+                attention_mask = tp_group.broadcast(attention_mask, src=0)
+                cos = tp_group.broadcast(cos, src=0)
+                sin = tp_group.broadcast(sin, src=0)
 
         if self._cache_dit_adapter is not None:
             output = self._cache_dit_adapter(hidden_states, attention_mask, (cos, sin))
@@ -346,24 +339,6 @@ class HunyuanImage3AR(PipelineStage):
         actual_seq_len = output.shape[0] // actual_batch
         return output.view(actual_batch, actual_seq_len, hidden_size)
 
-    def _broadcast_static_inputs(
-        self,
-        attention_mask: torch.Tensor,
-        custom_pos_emb: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Synchronize request-static attention inputs once across TP ranks."""
-        attention_mask = attention_mask.contiguous()
-        cos, sin = custom_pos_emb
-        cos = cos.contiguous()
-        sin = sin.contiguous()
-        if model_parallel_is_initialized():
-            tp_group = get_tp_group()
-            if tp_group.world_size > 1:
-                attention_mask = tp_group.broadcast(attention_mask, src=0)
-                cos = tp_group.broadcast(cos, src=0)
-                sin = tp_group.broadcast(sin, src=0)
-        return attention_mask, (cos, sin)
-
     def _instantiate_vae_tokens_first_step(
         self,
         hidden_states: torch.Tensor,
@@ -379,7 +354,9 @@ class HunyuanImage3AR(PipelineStage):
             .unsqueeze(0)
             .expand(bsz, -1)
         )
-        image_scatter_index = image_scatter_index.masked_select(image_mask.bool()).reshape(bsz, -1)
+        image_scatter_index = image_scatter_index.masked_select(
+            image_mask.bool()
+        ).reshape(bsz, -1)
         hidden_states.scatter_(
             dim=1,
             index=image_scatter_index.unsqueeze(-1).expand(-1, -1, n_embd),
@@ -407,22 +384,6 @@ class HunyuanImage3AR(PipelineStage):
             ts_scatter_index = timestep_index.long()
 
         num_positions = ts_scatter_index.shape[1]
-        if ts_scatter_index.shape[0] != bsz or timestep_emb.shape[1] != num_positions:
-            # Covers both the gen-timestep and cond-timestep callers; without
-            # this the expand below fails with a cryptic broadcast error.
-            logger.error(
-                "timestep scatter mismatch: bsz=%d seqlen=%d "
-                "timestep_index=%s dtype=%s timesteps=%s "
-                "timestep_emb=%s",
-                bsz, seqlen, tuple(timestep_index.shape), timestep_index.dtype,
-                tuple(timesteps.shape), tuple(timestep_emb.shape),
-            )
-            raise RuntimeError(
-                "timestep scatter mismatch: "
-                f"timestep_emb rows {timestep_emb.shape[1]} vs "
-                f"index positions {num_positions} "
-                f"(bsz {ts_scatter_index.shape[0]} vs {bsz})"
-            )
         timestep_emb = timestep_emb.expand(-1, num_positions, -1)
         hidden_states.scatter_(
             dim=1,
@@ -460,7 +421,9 @@ class HunyuanImage3AR(PipelineStage):
         else:
             resize_width = tw
             resize_height = int(round(tw / w * h))
-        resized = image.resize((resize_width, resize_height), PILImage.Resampling.LANCZOS)
+        resized = image.resize(
+            (resize_width, resize_height), PILImage.Resampling.LANCZOS
+        )
         crop_left = int(round((resize_width - tw) / 2.0))
         crop_top = int(round((resize_height - th) / 2.0))
         return resized.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
@@ -557,9 +520,7 @@ class HunyuanImage3AR(PipelineStage):
         return per_request_joint_infos
 
     def _encode_conditions(self, per_request_joint_infos, device):
-        flat_infos = [
-            info for joints in per_request_joint_infos for info in joints
-        ]
+        flat_infos = [info for joints in per_request_joint_infos for info in joints]
         request_bounds = []
         offset = 0
         for joints in per_request_joint_infos:
@@ -574,22 +535,14 @@ class HunyuanImage3AR(PipelineStage):
                 [[] for _ in per_request_joint_infos],
             )
 
-        # Batched cond encoding is opt-in via env var: the AR backbone is
-        # resident on the same device, so full-batch encoding is tight on
-        # memory and stays sequential unless explicitly enabled.
-        batched = None
-        if envs.SGLANG_HI3_COND_ENCODE_BATCHING:
-            try:
-                batched = self._encode_conditions_batched(flat_infos, device)
-            except (torch.OutOfMemoryError, RuntimeError) as e:
-                if isinstance(e, RuntimeError) and "out of memory" not in str(
-                    e
-                ).lower():
-                    raise
-                logger.warning(
-                    "Batched cond encoding OOM; falling back to sequential"
-                )
-                _empty_device_cache()
+        try:
+            batched = self._encode_conditions_batched(flat_infos, device)
+        except (torch.OutOfMemoryError, RuntimeError) as e:
+            if isinstance(e, RuntimeError) and "out of memory" not in str(e).lower():
+                raise
+            logger.warning("Batched cond encoding OOM; falling back to sequential")
+            torch.get_device_module().empty_cache()
+            batched = None
         if batched is None:
             batched = self._encode_conditions_sequential(flat_infos, device)
         vae_embeds, t_values, vit_embeds = batched
@@ -600,9 +553,7 @@ class HunyuanImage3AR(PipelineStage):
         for start, end in request_bounds:
             per_request_vae_embeds.append(vae_embeds[start:end])
             t_slice = t_values[start:end]
-            per_request_t.append(
-                torch.cat(t_slice, dim=0) if t_slice else None
-            )
+            per_request_t.append(torch.cat(t_slice, dim=0) if t_slice else None)
             per_request_vit_embeds.append(vit_embeds[start:end])
         return per_request_vae_embeds, per_request_t, per_request_vit_embeds
 
@@ -658,29 +609,20 @@ class HunyuanImage3AR(PipelineStage):
     def _cond_vit_kwargs(info) -> dict:
         vit_kwargs = {
             "spatial_shapes": info.vision_encoder_kwargs["spatial_shapes"],
-            "attention_mask": info.vision_encoder_kwargs[
-                "pixel_attention_mask"
-            ],
+            "attention_mask": info.vision_encoder_kwargs["pixel_attention_mask"],
         }
         if vit_kwargs["spatial_shapes"].ndim == 1:
-            vit_kwargs["spatial_shapes"] = vit_kwargs[
-                "spatial_shapes"
-            ].unsqueeze(0)
+            vit_kwargs["spatial_shapes"] = vit_kwargs["spatial_shapes"].unsqueeze(0)
         if vit_kwargs["attention_mask"].ndim == 1:
-            vit_kwargs["attention_mask"] = vit_kwargs[
-                "attention_mask"
-            ].unsqueeze(0)
+            vit_kwargs["attention_mask"] = vit_kwargs["attention_mask"].unsqueeze(0)
         return vit_kwargs
 
-    def _encode_adaptive(self, count, run_batch, max_chunk=None):
+    def _encode_adaptive(self, count, run_batch):
         """Encode ``count`` items via ``run_batch(indices) -> list`` in the
         largest batch that fits.
 
-        Starts with every item in one batched call (capped to ``max_chunk``
-        when given -- the cap never blocks work, it only splits it: the
-        remaining items are processed in further calls of the same size).
-        On OOM it empties the cache, halves the batch, and retries the same
-        items -- down to one at a time.
+        Starts with every item in one batched call; on OOM it empties the cache,
+        halves the batch, and retries the same items -- down to one at a time.
         Chunking is bit-safe here: VAE conv is independent per batch row and the
         ViT isolates each image via its attention_mask + spatial_shapes (packed
         internally), so each image's embedding does not depend on which other
@@ -692,7 +634,7 @@ class HunyuanImage3AR(PipelineStage):
             return []
         results: list = []
         start = 0
-        chunk = count if max_chunk is None else min(count, max_chunk)
+        chunk = count
         while start < count:
             size = min(chunk, count - start)
             try:
@@ -701,7 +643,7 @@ class HunyuanImage3AR(PipelineStage):
             except (torch.OutOfMemoryError, RuntimeError) as e:
                 if not _is_oom_error(e):
                     raise
-                _empty_device_cache()
+                torch.get_device_module().empty_cache()
                 if size <= 1:
                     raise
                 chunk = size // 2
@@ -741,6 +683,7 @@ class HunyuanImage3AR(PipelineStage):
             dtype=torch.bfloat16,
             enabled=True,
         ):
+
             def _run_vae(idxs):
                 batched_vae = torch.cat(
                     [vae_tensors[i].to(dtype=vae_tensors[0].dtype) for i in idxs],
@@ -756,17 +699,9 @@ class HunyuanImage3AR(PipelineStage):
                 image_seq, _, _ = self.ar_model.patch_embed(
                     latents_chunk.to(device), t_emb
                 )
-                # Keep the batch dim per image ([1, L, C]) to match the
-                # sequential path; the scatter reshapes anyway.
-                return [
-                    (image_seq[k : k + 1], t_chunk[k : k + 1])
-                    for k in range(len(idxs))
-                ]
+                return [(image_seq[k], t_chunk[k : k + 1]) for k in range(len(idxs))]
 
-            max_chunk = self._max_cond_encode_chunk
-            vae_results = self._encode_adaptive(
-                len(flat_infos), _run_vae, max_chunk=max_chunk
-            )
+            vae_results = self._encode_adaptive(len(flat_infos), _run_vae)
             vae_embeds = [r[0] for r in vae_results]
             t_values = [r[1] for r in vae_results]
 
@@ -796,14 +731,16 @@ class HunyuanImage3AR(PipelineStage):
                 image_embed = self._vision_aligner(image_embed)
                 return [image_embed[b] for b in range(len(idxs))]
 
-            vit_embeds = self._encode_adaptive(
-                len(flat_infos), _run_vit, max_chunk=max_chunk
-            )
+            vit_embeds = self._encode_adaptive(len(flat_infos), _run_vit)
         return vae_embeds, t_values, vit_embeds
 
     def _scatter_cond_vae_tokens_batched(
-        self, hidden_states, per_request_vae_embeds,
-        cond_vae_slices_rows, n_req, do_cfg,
+        self,
+        hidden_states,
+        per_request_vae_embeds,
+        cond_vae_slices_rows,
+        n_req,
+        do_cfg,
     ):
         n_embd = hidden_states.shape[-1]
         for r, embeds in enumerate(per_request_vae_embeds):
@@ -820,8 +757,12 @@ class HunyuanImage3AR(PipelineStage):
         return hidden_states
 
     def _scatter_cond_vit_tokens_batched(
-        self, hidden_states, per_request_vit_embeds, cond_vit_slices_rows,
-        n_req, do_cfg,
+        self,
+        hidden_states,
+        per_request_vit_embeds,
+        cond_vit_slices_rows,
+        n_req,
+        do_cfg,
     ):
         # The uncond half of the CFG-packed sequence keeps the cond (joint)
         # image sections (only the text is replaced with <cfg> tokens), so the
@@ -836,9 +777,9 @@ class HunyuanImage3AR(PipelineStage):
                     positions = torch.arange(
                         s.start, s.stop, device=hidden_states.device
                     )
-                    hidden_states[row, positions] = embeds[i][
-                        : s.stop - s.start
-                    ].to(hidden_states.dtype)
+                    hidden_states[row, positions] = embeds[i][: s.stop - s.start].to(
+                        hidden_states.dtype
+                    )
         return hidden_states
 
     @staticmethod
@@ -851,7 +792,21 @@ class HunyuanImage3AR(PipelineStage):
 
     def _resolve_generation_params(self, reqs: list[Req], raw_conds_rows: list):
         head = reqs[0]
-        width, height = self._effective_resolution(head, raw_conds_rows[0])
+        target_sizes = [
+            self._effective_resolution(req, raw_cond_images)
+            for req, raw_cond_images in zip(reqs, raw_conds_rows)
+        ]
+        for req, target_size in zip(reqs, target_sizes):
+            req.extra[OUTPUT_GEOMETRY_EXTRA_KEY] = build_hunyuan_image3_output_geometry(
+                *target_size,
+                size_mode=getattr(req, "output_size_mode", "aspect_ratio"),
+                strategy=getattr(req, "output_strategy", "native_crop"),
+                ratio_policy=getattr(req, "output_ratio_policy", "exact"),
+                crop_anchor=getattr(req, "output_crop_anchor", (0.5, 0.5)),
+                max_ratio_error=getattr(req, "output_max_ratio_error", 0.0005),
+                pad_value=getattr(req, "output_pad_value", 0.0),
+            )
+        width, height = target_sizes[0]
         image_info = self._processor.build_gen_image_info(f"{height}x{width}")
         height = image_info.image_height
         width = image_info.image_width
@@ -859,13 +814,22 @@ class HunyuanImage3AR(PipelineStage):
         token_w = image_info.token_width
         image_info = self._rebuild_image_info(image_info)
         for req in reqs:
+            req.extra[OUTPUT_GEOMETRY_EXTRA_KEY]["native_bucket_size"] = [
+                width,
+                height,
+            ]
             req.width, req.height = width, height
 
         guidance_scale = head.guidance_scale
         num_inference_steps = head.num_inference_steps
         return (
-            width, height, token_h, token_w, image_info,
-            guidance_scale, num_inference_steps,
+            width,
+            height,
+            token_h,
+            token_w,
+            image_info,
+            guidance_scale,
+            num_inference_steps,
         )
 
     def _build_tokenizer_kwargs(
@@ -890,8 +854,8 @@ class HunyuanImage3AR(PipelineStage):
             reqs[0].system_prompt, bot_task=tokenizer_bot_task
         )
         if resolved_prompt is not None:
-            tokenizer_kwargs["batch_system_prompt"] = (
-                [resolved_prompt.strip()] * len(reqs)
+            tokenizer_kwargs["batch_system_prompt"] = [resolved_prompt.strip()] * len(
+                reqs
             )
         cot_texts = [req.cot_text for req in reqs]
         if any(cot is not None for cot in cot_texts):
@@ -926,8 +890,15 @@ class HunyuanImage3AR(PipelineStage):
         )
 
     def _build_attention_and_rope(
-        self, tokenizer_output, tokenizer_sections, actual_batch_size: int,
-        seq_len: int, token_h: int, token_w: int, image_info, device,
+        self,
+        tokenizer_output,
+        tokenizer_sections,
+        actual_batch_size: int,
+        seq_len: int,
+        token_h: int,
+        token_w: int,
+        image_info,
+        device,
         do_cfg: bool = False,
     ):
         gen_slices = tokenizer_output.gen_image_slices
@@ -957,7 +928,11 @@ class HunyuanImage3AR(PipelineStage):
         )
 
         rope_image_info = _build_rope_image_info(
-            tokenizer_output, actual_batch_size, token_h, token_w, image_info,
+            tokenizer_output,
+            actual_batch_size,
+            token_h,
+            token_w,
+            image_info,
             sections=tokenizer_sections,
         )
         cos, sin = self.ar_model.cached_rope(
@@ -975,8 +950,12 @@ class HunyuanImage3AR(PipelineStage):
         return latent_channels, height // vae_h, width // vae_w
 
     def _prepare_noise(
-        self, reqs: list[Req], latent_channels: int, latent_h: int,
-        latent_w: int, device: torch.device,
+        self,
+        reqs: list[Req],
+        latent_channels: int,
+        latent_h: int,
+        latent_w: int,
+        device: torch.device,
     ) -> torch.Tensor:
         # One generator per request keeps each request bit-identical with its
         # single-request run.
@@ -987,8 +966,13 @@ class HunyuanImage3AR(PipelineStage):
                 generator.manual_seed(req.seed)
             noise_rows.append(
                 torch.randn(
-                    1, latent_channels, latent_h, latent_w,
-                    generator=generator, device=device, dtype=torch.bfloat16,
+                    1,
+                    latent_channels,
+                    latent_h,
+                    latent_w,
+                    generator=generator,
+                    device=device,
+                    dtype=torch.bfloat16,
                 )
             )
         return torch.cat(noise_rows, dim=0)
@@ -998,27 +982,30 @@ class HunyuanImage3AR(PipelineStage):
         raw_cond_images = req.condition_image
         if raw_cond_images is None and req.image_path is not None:
             image_path = req.image_path
-            raw_cond_images = image_path if isinstance(image_path, list) else [image_path]
-        if raw_cond_images is not None and not isinstance(raw_cond_images, (list, tuple)):
+            raw_cond_images = (
+                image_path if isinstance(image_path, list) else [image_path]
+            )
+        if raw_cond_images is not None and not isinstance(
+            raw_cond_images, (list, tuple)
+        ):
             raw_cond_images = [raw_cond_images]
         return raw_cond_images
 
     @staticmethod
     def _effective_resolution(req: Req, raw_cond_images) -> tuple[int, int]:
-        # TI2I inherits the reference size unless the user set width/height.
-        user_explicit_fields = getattr(
-            req.sampling_params, "_explicit_fields", set()
+        # Use the input-validation snapshot, not condition_image, because the
+        # latter can have passed through generic preprocessing in older flows.
+        user_explicit_fields = getattr(req.sampling_params, "_explicit_fields", set())
+        reference_size = req.original_condition_image_size
+        if reference_size is None and raw_cond_images:
+            first_cond_pil = _cond_image_to_pil(raw_cond_images[0])
+            reference_size = first_cond_pil.size if first_cond_pil is not None else None
+        return resolve_hunyuan_image3_output_resolution(
+            req.width,
+            req.height,
+            user_explicit_fields,
+            reference_size,
         )
-        first_cond_pil = (
-            _cond_image_to_pil(raw_cond_images[0]) if raw_cond_images else None
-        )
-        if (
-            first_cond_pil is not None
-            and "width" not in user_explicit_fields
-            and "height" not in user_explicit_fields
-        ):
-            return align_hunyuan_image3_resolution(*first_cond_pil.size)
-        return align_hunyuan_image3_resolution(req.width, req.height)
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -1028,6 +1015,11 @@ class HunyuanImage3AR(PipelineStage):
             return outputs[0]
         batch.latents = torch.cat([out.latents for out in outputs], dim=0)
         batch.width, batch.height = outputs[0].width, outputs[0].height
+        output_extra = getattr(outputs[0], "extra", {})
+        if OUTPUT_GEOMETRY_EXTRA_KEY in output_extra:
+            batch.extra[OUTPUT_GEOMETRY_EXTRA_KEY] = output_extra[
+                OUTPUT_GEOMETRY_EXTRA_KEY
+            ]
         return batch
 
     def run_grouped_requests(
@@ -1103,6 +1095,12 @@ class HunyuanImage3AR(PipelineStage):
             self._normalize_bot_task(req.bot_task),
             req.system_prompt,
             n_cond,
+            req.output_size_mode,
+            req.output_strategy,
+            req.output_ratio_policy,
+            tuple(req.output_crop_anchor),
+            req.output_max_ratio_error,
+            req.output_pad_value,
         )
 
     @torch.no_grad()
@@ -1114,8 +1112,13 @@ class HunyuanImage3AR(PipelineStage):
         per_request_raw_conds = [self._collect_raw_cond_images(req) for req in reqs]
         has_cond = any(bool(conds) for conds in per_request_raw_conds)
         (
-            width, height, token_h, token_w, image_info,
-            guidance_scale, num_inference_steps,
+            width,
+            height,
+            token_h,
+            token_w,
+            image_info,
+            guidance_scale,
+            num_inference_steps,
         ) = self._resolve_generation_params(reqs, per_request_raw_conds)
         do_cfg = guidance_scale > 1.0
         cfg_factor = 2 if do_cfg else 1
@@ -1154,11 +1157,15 @@ class HunyuanImage3AR(PipelineStage):
         timestep_index = tok["timestep_index"]
 
         attention_mask, cos, sin, mask_shared = self._build_attention_and_rope(
-            tokenizer_output, tokenizer_sections, actual_batch_size,
-            tok["seq_len"], token_h, token_w, image_info, device, do_cfg,
-        )
-        attention_mask, (cos, sin) = self._broadcast_static_inputs(
-            attention_mask, (cos, sin)
+            tokenizer_output,
+            tokenizer_sections,
+            actual_batch_size,
+            tok["seq_len"],
+            token_h,
+            token_w,
+            image_info,
+            device,
+            do_cfg,
         )
 
         scheduler = self._scheduler
@@ -1166,9 +1173,7 @@ class HunyuanImage3AR(PipelineStage):
         timesteps = scheduler.timesteps
 
         latent_channels, latent_h, latent_w = self._latent_dims(height, width)
-        latents = self._prepare_noise(
-            reqs, latent_channels, latent_h, latent_w, device
-        )
+        latents = self._prepare_noise(reqs, latent_channels, latent_h, latent_w, device)
 
         per_request_vae_embeds: list[list] = []
         per_request_t: list = []
@@ -1180,7 +1185,9 @@ class HunyuanImage3AR(PipelineStage):
             self._vision_aligner.to(device)
             self._vision_aligner.eval()
             (
-                per_request_vae_embeds, per_request_t, per_request_vit_embeds,
+                per_request_vae_embeds,
+                per_request_t,
+                per_request_vit_embeds,
             ) = self._encode_conditions(per_request_joint_infos, device)
             has_cond_encoded = True
 
@@ -1209,57 +1216,39 @@ class HunyuanImage3AR(PipelineStage):
                 # Re-embed the full input_ids every step; shortening produces garbage.
                 hidden_states = self.ar_model.model.get_input_embeddings(input_ids)
                 hidden_states = self._instantiate_vae_tokens_first_step(
-                    hidden_states, latent_model_input, t_expand, image_mask,
+                    hidden_states,
+                    latent_model_input,
+                    t_expand,
+                    image_mask,
                 )
                 if timestep_index is not None:
                     hidden_states = self._instantiate_timestep_tokens(
-                        hidden_states, t_expand, timestep_index,
+                        hidden_states,
+                        t_expand,
+                        timestep_index,
                     )
 
                 if has_cond_encoded:
                     hidden_states = self._scatter_cond_vae_tokens_batched(
-                        hidden_states, per_request_vae_embeds,
-                        cond_vae_slices_rows, n_req, do_cfg,
+                        hidden_states,
+                        per_request_vae_embeds,
+                        cond_vae_slices_rows,
+                        n_req,
+                        do_cfg,
                     )
                     hidden_states = self._scatter_cond_vit_tokens_batched(
-                        hidden_states, per_request_vit_embeds,
-                        cond_vit_slices_rows, n_req, do_cfg,
+                        hidden_states,
+                        per_request_vit_embeds,
+                        cond_vit_slices_rows,
+                        n_req,
+                        do_cfg,
                     )
                     if cond_timestep_scatter_index is not None:
                         all_cond_t = torch.cat(per_request_t, dim=0).repeat(cfg_factor)
-                        cond_ts_index = cond_timestep_scatter_index
-                        # Legacy tokenizer shapes: 1-D [P] or [1, P] must be
-                        # expanded to one index row per sequence row (the
-                        # cfg-packed uncond rows keep the cond sections too).
-                        if cond_ts_index.ndim == 1:
-                            cond_ts_index = cond_ts_index.unsqueeze(0).expand(
-                                actual_batch_size, -1
-                            )
-                        elif cond_ts_index.shape[0] == 1 and actual_batch_size > 1:
-                            cond_ts_index = cond_ts_index.expand(actual_batch_size, -1)
-                        expected_t = (
-                            cond_ts_index.shape[0] * cond_ts_index.shape[1]
-                        )
-                        if all_cond_t.shape[0] != expected_t:
-                            logger.error(
-                                "cond timestep scatter mismatch: "
-                                "all_cond_t=%d n_req=%d cfg_factor=%d "
-                                "conds_per_req=%s scatter_index=%s "
-                                "cond_vae_slices=%s",
-                                all_cond_t.shape[0], n_req, cfg_factor,
-                                [len(j) for j in per_request_joint_infos],
-                                tuple(cond_timestep_scatter_index.shape),
-                                [len(s) for s in cond_vae_slices_rows],
-                            )
-                            raise RuntimeError(
-                                "cond timestep scatter mismatch: "
-                                f"{all_cond_t.shape[0]} t values for "
-                                f"{cond_ts_index.shape} scatter index"
-                            )
                         hidden_states = self._instantiate_timestep_tokens(
                             hidden_states,
                             all_cond_t.to(hidden_states.device),
-                            cond_ts_index,
+                            cond_timestep_scatter_index,
                         )
 
                 # CFG: run cond/uncond halves separately (halves peak attention memory).
@@ -1268,27 +1257,42 @@ class HunyuanImage3AR(PipelineStage):
                     # With a shared half-mask, reuse it for both calls instead of
                     # slicing a full-batch mask whose two halves are never both live.
                     cond_mask = attention_mask if mask_shared else attention_mask[:half]
-                    uncond_mask = attention_mask if mask_shared else attention_mask[half:]
+                    uncond_mask = (
+                        attention_mask if mask_shared else attention_mask[half:]
+                    )
                     out_cond = self._backbone_forward(
-                        num_image_tokens, hidden_states[:half],
-                        cond_mask, (cos[:half], sin[:half]), True,
+                        num_image_tokens,
+                        hidden_states[:half],
+                        cond_mask,
+                        (cos[:half], sin[:half]),
+                        True,
                         timestep=t_expand[:half],
                     )
                     out_uncond = self._backbone_forward(
-                        num_image_tokens, hidden_states[half:],
-                        uncond_mask, (cos[half:], sin[half:]), True,
+                        num_image_tokens,
+                        hidden_states[half:],
+                        uncond_mask,
+                        (cos[half:], sin[half:]),
+                        True,
                         timestep=t_expand[half:],
                     )
                     backbone_out = torch.cat([out_cond, out_uncond], dim=0)
                 else:
                     backbone_out = self._backbone_forward(
-                        num_image_tokens, hidden_states, attention_mask,
-                        (cos, sin), True,
+                        num_image_tokens,
+                        hidden_states,
+                        attention_mask,
+                        (cos, sin),
+                        True,
                         timestep=t_expand,
                     )
 
                 pred = self._extract_diffusion_pred(
-                    backbone_out, t_expand, image_mask, token_h, token_w,
+                    backbone_out,
+                    t_expand,
+                    image_mask,
+                    token_h,
+                    token_w,
                 )
 
             pred = pred.float()
@@ -1298,7 +1302,9 @@ class HunyuanImage3AR(PipelineStage):
                 pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
 
             latent_dtype = latents.dtype
-            latents = scheduler.step(pred, t, latents, return_dict=False)[0].to(dtype=latent_dtype)
+            latents = scheduler.step(pred, t, latents, return_dict=False)[0].to(
+                dtype=latent_dtype
+            )
 
         # [B, C, H, W] -> [B, C, 1, H, W]
         latents = latents.to(torch.bfloat16)
