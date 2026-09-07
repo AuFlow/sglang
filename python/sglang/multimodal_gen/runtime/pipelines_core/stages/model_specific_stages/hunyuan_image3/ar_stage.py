@@ -38,8 +38,8 @@ from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 from .prompts import resolve_system_prompt
 from .resolution import (
-    RESTORE_SIZE_EXTRA_KEY,
-    calculate_hunyuan_image3_restored_size,
+    OUTPUT_GEOMETRY_EXTRA_KEY,
+    build_hunyuan_image3_output_geometry,
     resolve_hunyuan_image3_output_resolution,
 )
 from .tokenizer import (
@@ -796,6 +796,16 @@ class HunyuanImage3AR(PipelineStage):
             self._effective_resolution(req, raw_cond_images)
             for req, raw_cond_images in zip(reqs, raw_conds_rows)
         ]
+        for req, target_size in zip(reqs, target_sizes):
+            req.extra[OUTPUT_GEOMETRY_EXTRA_KEY] = build_hunyuan_image3_output_geometry(
+                *target_size,
+                size_mode=getattr(req, "output_size_mode", "aspect_ratio"),
+                strategy=getattr(req, "output_strategy", "native_crop"),
+                ratio_policy=getattr(req, "output_ratio_policy", "exact"),
+                crop_anchor=getattr(req, "output_crop_anchor", (0.5, 0.5)),
+                max_ratio_error=getattr(req, "output_max_ratio_error", 0.0005),
+                pad_value=getattr(req, "output_pad_value", 0.0),
+            )
         width, height = target_sizes[0]
         image_info = self._processor.build_gen_image_info(f"{height}x{width}")
         height = image_info.image_height
@@ -803,13 +813,11 @@ class HunyuanImage3AR(PipelineStage):
         token_h = image_info.token_height
         token_w = image_info.token_width
         image_info = self._rebuild_image_info(image_info)
-        base_size = int(self._processor.vae_reso_group.base_size)
-        target_area = base_size**2
-        for req, target_size in zip(reqs, target_sizes):
-            req.extra[RESTORE_SIZE_EXTRA_KEY] = calculate_hunyuan_image3_restored_size(
-                *target_size,
-                target_area=target_area,
-            )
+        for req in reqs:
+            req.extra[OUTPUT_GEOMETRY_EXTRA_KEY]["native_bucket_size"] = [
+                width,
+                height,
+            ]
             req.width, req.height = width, height
 
         guidance_scale = head.guidance_scale
@@ -1007,7 +1015,11 @@ class HunyuanImage3AR(PipelineStage):
             return outputs[0]
         batch.latents = torch.cat([out.latents for out in outputs], dim=0)
         batch.width, batch.height = outputs[0].width, outputs[0].height
-        batch.extra[RESTORE_SIZE_EXTRA_KEY] = outputs[0].extra[RESTORE_SIZE_EXTRA_KEY]
+        output_extra = getattr(outputs[0], "extra", {})
+        if OUTPUT_GEOMETRY_EXTRA_KEY in output_extra:
+            batch.extra[OUTPUT_GEOMETRY_EXTRA_KEY] = output_extra[
+                OUTPUT_GEOMETRY_EXTRA_KEY
+            ]
         return batch
 
     def run_grouped_requests(
@@ -1083,6 +1095,12 @@ class HunyuanImage3AR(PipelineStage):
             self._normalize_bot_task(req.bot_task),
             req.system_prompt,
             n_cond,
+            req.output_size_mode,
+            req.output_strategy,
+            req.output_ratio_policy,
+            tuple(req.output_crop_anchor),
+            req.output_max_ratio_error,
+            req.output_pad_value,
         )
 
     @torch.no_grad()

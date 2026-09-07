@@ -19,11 +19,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3.decoding import (
     HunyuanImage3DecodingStage,
-    resize_hunyuan_image3_decoded_frames,
+    _build_spatial_plan,
+    apply_hunyuan_image3_spatial_plan,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3.resolution import (
-    RESTORE_SIZE_EXTRA_KEY,
-    calculate_hunyuan_image3_restored_size,
+    OUTPUT_GEOMETRY_EXTRA_KEY,
+    build_hunyuan_image3_output_geometry,
     resolve_hunyuan_image3_output_resolution,
 )
 
@@ -81,46 +82,80 @@ def test_text_to_image_without_reference_keeps_raw_request_size():
     assert (width, height) == (1025, 577)
 
 
-def test_restored_size_preserves_explicit_target_aspect_ratio():
-    restored_width, restored_height = calculate_hunyuan_image3_restored_size(
-        target_width=1000,
-        target_height=700,
-        target_area=1024**2,
+def test_generation_saves_requested_ratio_before_selecting_native_bucket(monkeypatch):
+    requested_size = (1000, 700)
+    native_size = (1216, 832)
+    image_info = SimpleNamespace(
+        image_width=native_size[0],
+        image_height=native_size[1],
+        token_width=native_size[0] // 16,
+        token_height=native_size[1] // 16,
+    )
+    processor = SimpleNamespace(
+        build_gen_image_info=lambda image_size: image_info,
+    )
+    request = SimpleNamespace(
+        width=requested_size[0],
+        height=requested_size[1],
+        sampling_params=SimpleNamespace(_explicit_fields={"width", "height"}),
+        original_condition_image_size=None,
+        guidance_scale=2.5,
+        num_inference_steps=50,
+        extra={},
+    )
+    stage = object.__new__(HunyuanImage3AR)
+    stage._processor = processor
+    monkeypatch.setattr(stage, "_rebuild_image_info", lambda info: info)
+
+    width, height, *_ = stage._resolve_generation_params([request], [None])
+
+    assert (width, height) == native_size
+    assert (request.width, request.height) == native_size
+    assert request.extra[OUTPUT_GEOMETRY_EXTRA_KEY] == {
+        "requested_size": [1000, 700],
+        "requested_aspect_ratio": [10, 7],
+        "size_mode": "aspect_ratio",
+        "strategy": "native_crop",
+        "ratio_policy": "exact",
+        "crop_anchor": [0.5, 0.5],
+        "max_ratio_error": 0.0005,
+        "pad_value": 0.0,
+        "native_bucket_size": [1216, 832],
+    }
+
+
+def test_native_crop_is_maximum_area_strict_ratio_and_preserves_pixels():
+    geometry = build_hunyuan_image3_output_geometry(1000, 700)
+    frames = torch.arange(1216 * 832, dtype=torch.float32).reshape(1, 1, 832, 1216)
+
+    plan, metadata = _build_spatial_plan((1216, 832), geometry)
+    cropped = apply_hunyuan_image3_spatial_plan(frames, plan)
+
+    assert metadata["crop_box"] == [18, 3, 1198, 829]
+    assert metadata["output_size"] == [1180, 826]
+    assert metadata["relative_ratio_error"] == 0.0
+    assert metadata["resampled"] is False
+    assert cropped.shape == (1, 1, 826, 1180)
+    assert torch.equal(cropped, frames[..., 3:829, 18:1198])
+
+
+def test_native_crop_reuses_the_same_plan_for_trajectory_frames():
+    geometry = build_hunyuan_image3_output_geometry(1000, 700)
+    image = torch.zeros(2, 3, 1, 832, 1216)
+    trajectory = torch.ones(2, 3, 1, 832, 1216)
+
+    plan, _ = _build_spatial_plan((1216, 832), geometry)
+
+    assert apply_hunyuan_image3_spatial_plan(image, plan).shape == (2, 3, 1, 826, 1180)
+    assert torch.equal(
+        apply_hunyuan_image3_spatial_plan(trajectory, plan),
+        trajectory[..., 3:829, 18:1198],
     )
 
-    assert (restored_width, restored_height) == (1224, 857)
-    native_ratio_error = abs(1216 / 832 - 1000 / 700)
-    restored_ratio_error = abs(restored_width / restored_height - 1000 / 700)
-    assert restored_ratio_error < native_ratio_error
 
-
-def test_decoded_frames_are_resized_to_restored_aspect_ratio():
-    frames = torch.zeros(1, 3, 1, 32, 64)
-
-    restored = resize_hunyuan_image3_decoded_frames(frames, (76, 54))
-
-    assert restored.shape == (1, 3, 1, 54, 76)
-
-
-def test_decoded_frames_with_matching_ratio_are_not_resampled():
-    frames = torch.zeros(1, 3, 1, 36, 64)
-
-    restored = resize_hunyuan_image3_decoded_frames(frames, (1280, 720))
-
-    assert restored is frames
-
-
-def test_decoded_image_batch_is_resized_to_restored_aspect_ratio():
-    images = torch.zeros(2, 3, 32, 64)
-
-    restored = resize_hunyuan_image3_decoded_frames(images, (76, 54))
-
-    assert restored.shape == (2, 3, 54, 76)
-
-
-def test_decoding_stage_restores_outputs_and_trajectories(monkeypatch):
-    frames = torch.zeros(2, 3, 1, 32, 64)
-    trajectory = torch.zeros(2, 3, 1, 32, 64)
+def test_decoding_stage_crops_images_and_trajectories_with_one_plan(monkeypatch):
+    frames = torch.zeros(2, 3, 1, 832, 1216)
+    trajectory = torch.ones(2, 3, 1, 832, 1216)
 
     def fake_decode(_stage, _batch, _server_args):
         return OutputBatch(output=frames, trajectory_decoded=[trajectory])
@@ -128,23 +163,50 @@ def test_decoding_stage_restores_outputs_and_trajectories(monkeypatch):
     monkeypatch.setattr(DecodingStage, "forward", fake_decode)
     stage = object.__new__(HunyuanImage3DecodingStage)
     batch = Req(sampling_params=SamplingParams(prompt="test", width=1000, height=700))
-    batch.extra[RESTORE_SIZE_EXTRA_KEY] = (76, 54)
+    batch.extra[OUTPUT_GEOMETRY_EXTRA_KEY] = build_hunyuan_image3_output_geometry(
+        1000, 700
+    )
 
     output = stage.forward(batch, SimpleNamespace())
 
-    assert output.output.shape == (2, 3, 1, 54, 76)
-    assert output.trajectory_decoded[0].shape == (2, 3, 1, 54, 76)
-    assert (batch.width, batch.height) == (76, 54)
+    assert output.output.shape == (2, 3, 1, 826, 1180)
+    assert output.trajectory_decoded[0].shape == (2, 3, 1, 826, 1180)
+    assert (batch.width, batch.height) == (1180, 826)
+    assert batch.extra[OUTPUT_GEOMETRY_EXTRA_KEY]["crop_box"] == [18, 3, 1198, 829]
 
 
-def test_multi_output_request_keeps_restored_size_metadata(monkeypatch):
-    restore_size = (1224, 857)
+def test_exact_size_performs_one_uniform_final_resample():
+    geometry = build_hunyuan_image3_output_geometry(1000, 700, size_mode="exact_size")
+    frames = torch.zeros(1, 3, 1, 832, 1216)
+
+    plan, metadata = _build_spatial_plan((1216, 832), geometry)
+    output = apply_hunyuan_image3_spatial_plan(frames, plan)
+
+    assert plan.crop_box == (18, 3, 1198, 829)
+    assert plan.resize_size == (1000, 700)
+    assert output.shape == (1, 3, 1, 700, 1000)
+    assert metadata["resampled"] is True
+
+
+def test_native_pad_retains_all_decoded_pixels():
+    geometry = build_hunyuan_image3_output_geometry(1000, 700, strategy="native_pad")
+    frames = torch.ones(1, 1, 832, 1216)
+
+    plan, metadata = _build_spatial_plan((1216, 832), geometry)
+    padded = apply_hunyuan_image3_spatial_plan(frames, plan)
+
+    assert plan.padding == (2, 2, 11, 11)
+    assert padded.shape == (1, 1, 854, 1220)
+    assert torch.equal(padded[..., 11:843, 2:1218], frames)
+    assert metadata["retained_pixel_fraction"] == 1.0
+
+
+def test_multi_output_request_keeps_native_bucket_size(monkeypatch):
     outputs = [
         SimpleNamespace(
             latents=torch.zeros(1, 1, 1, 1, 1),
             width=1216,
             height=832,
-            extra={RESTORE_SIZE_EXTRA_KEY: restore_size},
         )
         for _ in range(2)
     ]
@@ -164,7 +226,7 @@ def test_multi_output_request_keeps_restored_size_metadata(monkeypatch):
 
     assert output is batch
     assert output.latents.shape[0] == 2
-    assert output.extra[RESTORE_SIZE_EXTRA_KEY] == restore_size
+    assert (output.width, output.height) == (1216, 832)
 
 
 def test_pipeline_config_delegates_condition_image_sizing_to_native_stage():
