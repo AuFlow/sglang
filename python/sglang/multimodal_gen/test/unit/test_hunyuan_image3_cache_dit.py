@@ -18,14 +18,11 @@ class _MountedCacheDitBlocks(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        *,
-        attn_meta,
         attention_mask: torch.Tensor,
         custom_pos_emb: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         self.calls.append(
             {
-                "attn_meta": attn_meta,
                 "attention_mask": attention_mask,
                 "custom_pos_emb": custom_pos_emb,
             }
@@ -57,7 +54,7 @@ class _NativeBackbone:
         return hidden_states + 2
 
 
-def test_forward_uses_native_backbone_when_cache_dit_is_disabled():
+def test_forward_block_uses_native_backbone_without_timestep():
     model = hunyuan_image3.HunyuanImage3ForCausalMM.__new__(
         hunyuan_image3.HunyuanImage3ForCausalMM
     )
@@ -70,7 +67,7 @@ def test_forward_uses_native_backbone_when_cache_dit_is_disabled():
     cos = torch.zeros(1, 3, 2)
     sin = torch.ones(1, 3, 2)
 
-    output = model.forward(
+    output = model.forward_block(
         hidden_states,
         attention_mask=attention_mask,
         custom_pos_emb=(cos, sin),
@@ -88,19 +85,11 @@ def test_forward_uses_native_backbone_when_cache_dit_is_disabled():
     assert call["first_step"] is True
 
 
-def test_forward_executes_cache_dit_mounted_blocks(monkeypatch):
-    """The native forward accepts cache-dit's temporary block replacement."""
-    model = hunyuan_image3.HunyuanImage3ForCausalMM.__new__(
-        hunyuan_image3.HunyuanImage3ForCausalMM
-    )
-    nn.Module.__init__(model)
-    model.model = SimpleNamespace(config=SimpleNamespace(use_cla=False))
-
+def test_adapter_executes_cache_dit_mounted_blocks(monkeypatch):
+    model = SimpleNamespace(config=SimpleNamespace(use_cla=False), layers=[])
+    adapter = hunyuan_image3.Hi3CacheBlockAdapter(model)
     mounted_blocks = _MountedCacheDitBlocks()
-    # Cache-DiT temporarily replaces `transformer_blocks` with exactly this
-    # shape: a ModuleList containing one CachedBlocks_Pattern_3_4_5 wrapper.
-    model.transformer_blocks = nn.ModuleList([mounted_blocks])
-    model._sglang_cache_dit_adapter = object()
+    adapter.blocks = nn.ModuleList([mounted_blocks])
 
     attention_meta = object()
     monkeypatch.setattr(
@@ -114,7 +103,7 @@ def test_forward_executes_cache_dit_mounted_blocks(monkeypatch):
     cos = torch.zeros(1, 3, 2)
     sin = torch.ones(1, 3, 2)
 
-    output = model.forward(
+    output = adapter(
         hidden_states,
         attention_mask=attention_mask,
         custom_pos_emb=(cos, sin),
@@ -125,7 +114,8 @@ def test_forward_executes_cache_dit_mounted_blocks(monkeypatch):
     assert torch.equal(output, hidden_states + 1)
     assert len(mounted_blocks.calls) == 1
     call = mounted_blocks.calls[0]
-    assert call["attn_meta"] is attention_meta
+    assert adapter._attn_meta is None
+    assert adapter._prev_kv_states is None
     assert call["attention_mask"] is attention_mask
     assert call["custom_pos_emb"][0] is cos
     assert call["custom_pos_emb"][1] is sin

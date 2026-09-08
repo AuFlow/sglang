@@ -9,9 +9,8 @@ from PIL import Image as PILImage
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
-    CacheDitConfig,
-    enable_cache_on_transformer,
-    refresh_context_on_transformer,
+    CacheDitController,
+    resolve_cache_dit_request_overrides,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -36,11 +35,6 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import load_dict
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.vision import load_image
 
-from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
-    CacheDitController,
-    resolve_cache_dit_request_overrides,
-)
 from .prompts import resolve_system_prompt
 from .resolution import (
     OUTPUT_GEOMETRY_EXTRA_KEY,
@@ -225,7 +219,6 @@ class HunyuanImage3AR(PipelineStage):
         self._gen_config_cache: dict | None = None
         self._cache_dit_adapter = None
         self._cache_dit_controller: CacheDitController | None = None
-        self._active_server_args: ServerArgs | None = None
 
     def _generation_config(self) -> dict:
         if self._gen_config_cache is None:
@@ -653,7 +646,7 @@ class HunyuanImage3AR(PipelineStage):
         """Encode ``count`` items via ``run_batch(indices) -> list`` in the
         largest batch that fits.
 
-        Starts with every item in one batched call; on OOM it empties the cache,
+        Starts within the configured chunk cap; on OOM it empties the cache,
         halves the batch, and retries the same items -- down to one at a time.
         Chunking is bit-safe here: VAE conv is independent per batch row and the
         ViT isolates each image via its attention_mask + spatial_shapes (packed
@@ -666,7 +659,8 @@ class HunyuanImage3AR(PipelineStage):
             return []
         results: list = []
         start = 0
-        chunk = count
+        cap = self._max_cond_encode_chunk
+        chunk = min(count, cap) if cap is not None and cap > 1 else count
         while start < count:
             size = min(chunk, count - start)
             try:
@@ -1041,9 +1035,8 @@ class HunyuanImage3AR(PipelineStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        self._active_server_args = server_args
         clones = self._expand_multi_output(batch)
-        outputs = self._forward_batched(clones)
+        outputs = self._forward_batched(clones, server_args)
         if len(outputs) == 1:
             return outputs[0]
         batch.latents = torch.cat([out.latents for out in outputs], dim=0)
@@ -1060,7 +1053,6 @@ class HunyuanImage3AR(PipelineStage):
         batches: list[Req],
         server_args: ServerArgs,
     ) -> list[Req]:
-        self._active_server_args = server_args
         flat: list[Req] = []
         for batch in batches:
             flat.extend(self._expand_multi_output(batch))
@@ -1085,7 +1077,7 @@ class HunyuanImage3AR(PipelineStage):
                 index, req = group[0]
                 results[index] = self(req, server_args)
                 continue
-            outputs = self._forward_batched([req for _, req in group])
+            outputs = self._forward_batched([req for _, req in group], server_args)
             for (index, _), output in zip(group, outputs):
                 results[index] = output
 
@@ -1159,7 +1151,9 @@ class HunyuanImage3AR(PipelineStage):
         )
 
     @torch.no_grad()
-    def _forward_batched(self, reqs: list[Req]) -> list[Req]:
+    def _forward_batched(
+        self, reqs: list[Req], server_args: ServerArgs
+    ) -> list[Req]:
         tokenizer = self._custom_tokenizer
         n_req = len(reqs)
         head = reqs[0]
@@ -1187,10 +1181,8 @@ class HunyuanImage3AR(PipelineStage):
         else:
             device = model_device
 
-        if self._active_server_args is None:
-            raise RuntimeError("HunyuanImage3AR requires server_args before inference.")
         self._maybe_enable_cache_dit(
-            num_inference_steps, head, self._active_server_args, do_cfg
+            num_inference_steps, head, server_args, do_cfg
         )
 
         tokenizer_bot_task = self._normalize_bot_task(head.bot_task)
