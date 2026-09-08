@@ -70,12 +70,13 @@ class TestHunyuanImage3TPBroadcast(CustomTestCase):
             node
             for node in ast.walk(function)
             if isinstance(node, ast.For)
-            and any(
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Name)
-                and child.func.id == "enumerate"
-                for child in ast.walk(node.iter)
-            )
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Name)
+            and node.iter.func.id == "enumerate"
+            and node.iter.args
+            and isinstance(node.iter.args[0], ast.Call)
+            and isinstance(node.iter.args[0].func, ast.Attribute)
+            and node.iter.args[0].func.attr == "progress_bar"
         ]
         self.assertEqual(len(denoising_loops), 1)
         self.assertLess(
