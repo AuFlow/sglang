@@ -8,6 +8,7 @@ This module defines the abstract base classes for pipeline stages that can be
 composed to create complete diffusion pipelines.
 """
 
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -132,6 +133,9 @@ class PipelineStage(StageDedupMixin, ABC):
     ) -> tqdm:
         is_main_rank = not world_group_is_initialized() or get_world_rank() == 0
         disable = disable or (batch is not None and batch.is_warmup)
+        # tqdm defaults to stderr, which deployment log collectors surface as an
+        # error line; progress output belongs on stdout with the other logs.
+        kwargs.setdefault("file", sys.stdout)
         return tqdm(
             iterable=iterable,
             total=total,
