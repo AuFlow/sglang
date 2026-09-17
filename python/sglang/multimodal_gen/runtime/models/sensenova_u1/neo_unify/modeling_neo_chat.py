@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch.utils.checkpoint
 import transformers
+from sglang.multimodal_gen.configs.sensenova_u1 import derive_cache_branch_count
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers import GenerationConfig
@@ -1893,11 +1894,15 @@ class NEOChatModel(PreTrainedModel):
         merge_size = int(1 / self.downsample_ratio)
         question_condition = f"{prompt}"
         think_text = ""
-        needs_cfg = not (cfg_scale == 1 and img_cfg_scale == 1)
-        needs_img_condition = needs_cfg and (
-            img_cfg_scale == 1 or cfg_scale != img_cfg_scale
+        branch_count = derive_cache_branch_count(
+            is_edit=True, cfg_scale=cfg_scale, img_cfg_scale=img_cfg_scale
         )
-        needs_uncondition = needs_cfg and img_cfg_scale != 1
+        needs_img_condition = branch_count == 3 or (
+            branch_count == 2 and img_cfg_scale == 1
+        )
+        needs_uncondition = branch_count == 3 or (
+            branch_count == 2 and cfg_scale == img_cfg_scale
+        )
 
         think_content = (
             "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN

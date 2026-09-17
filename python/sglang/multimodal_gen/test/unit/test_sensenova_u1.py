@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
@@ -18,6 +17,7 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
+    derive_cache_branch_count,
 )
 from sglang.multimodal_gen.registry import (
     _get_config_info,
@@ -59,6 +59,23 @@ class _FakeSenseNovaModel:
 
     def t2i_generate(self, tokenizer, prompt, **kwargs):
         self.call_kwargs = {"tokenizer": tokenizer, "prompt": prompt, **kwargs}
+        return torch.tensor(
+            [
+                [
+                    [[-1.0, 0.0], [0.5, 1.0]],
+                    [[-1.0, 0.0], [0.5, 1.0]],
+                    [[-1.0, 0.0], [0.5, 1.0]],
+                ]
+            ]
+        )
+
+    def it2i_generate(self, tokenizer, prompt, images, **kwargs):
+        self.call_kwargs = {
+            "tokenizer": tokenizer,
+            "prompt": prompt,
+            "images": images,
+            **kwargs,
+        }
         return torch.tensor(
             [
                 [
@@ -157,6 +174,111 @@ def _cache_dit_batch(
         ),
         extra={} if extra is None else extra,
     )
+
+
+@pytest.mark.parametrize(
+    ("is_edit", "cfg_scale", "img_cfg_scale", "expected"),
+    [
+        (False, 0.5, 1.0, 1),
+        (False, 4.0, 1.0, 2),
+        (True, 0.5, 1.0, 2),
+        (True, 1.0, 1.0, 1),
+        (True, 4.0, 1.0, 2),
+        (True, 4.0, 4.0, 2),
+        (True, 4.0, 2.0, 3),
+    ],
+)
+def test_sensenova_u1_cache_branch_count_matches_generation_schedule(
+    is_edit, cfg_scale, img_cfg_scale, expected
+):
+    assert (
+        derive_cache_branch_count(
+            is_edit=is_edit,
+            cfg_scale=cfg_scale,
+            img_cfg_scale=img_cfg_scale,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("cfg_scale", "img_cfg_scale", "cfg_interval", "expected_enabled"),
+    [
+        (0.5, 1.0, (0.0, 1.0), True),
+        (1.0, 1.0, (0.0, 1.0), True),
+        (4.0, 1.0, (0.0, 1.0), True),
+        (4.0, 4.0, (0.0, 1.0), True),
+        (4.0, 2.0, (0.0, 1.0), False),
+        (0.5, 1.0, (0.2, 0.8), False),
+    ],
+)
+def test_sensenova_u1_it2i_cache_dit_fails_closed_for_unsupported_schedules(
+    monkeypatch, cfg_scale, img_cfg_scale, cfg_interval, expected_enabled
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    stage = SenseNovaU1GenerationStage(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
+        tokenizer="tok",
+    )
+    branch_count = derive_cache_branch_count(
+        is_edit=True,
+        cfg_scale=cfg_scale,
+        img_cfg_scale=img_cfg_scale,
+    )
+
+    stage._maybe_enable_cache_dit(
+        _cache_dit_batch(guidance_scale=cfg_scale),
+        _cache_dit_server_args(),
+        branch_count=branch_count,
+        cfg_interval=cfg_interval,
+    )
+
+    assert bool(calls["enable"]) is expected_enabled
+    if expected_enabled:
+        assert calls["enable"][0][2]["has_separate_cfg"] is (branch_count == 2)
+
+
+@pytest.mark.parametrize(
+    ("first_branch_count", "second_branch_count"),
+    [(1, 2), (2, 1)],
+)
+def test_sensenova_u1_cache_dit_remounts_between_single_and_edit_two_branch_modes(
+    monkeypatch, first_branch_count, second_branch_count
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    stage = SenseNovaU1GenerationStage(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
+        tokenizer="tok",
+    )
+    batch = _cache_dit_batch(cache_dit_params={"residual_diff_threshold": 0.1})
+
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        branch_count=first_branch_count,
+        cfg_interval=(0.0, 1.0),
+    )
+    stage._maybe_enable_cache_dit(
+        batch,
+        _cache_dit_server_args(),
+        branch_count=second_branch_count,
+        cfg_interval=(0.0, 1.0),
+    )
+
+    assert len(calls["enable"]) == 2
+    assert calls["disable"] == [transformer]
+    assert [call[2]["has_separate_cfg"] for call in calls["enable"]] == [
+        first_branch_count == 2,
+        second_branch_count == 2,
+    ]
 
 
 class _CacheDitRecordingBlock(torch.nn.Module):
@@ -468,10 +590,14 @@ def test_sensenova_u1_sampling_params_keep_private_defaults_internal():
     assert params.num_outputs_per_prompt == 1
     assert params.cfg_norm == "none"
     assert params.timestep_shift == 3.0
+    assert SenseNovaU1SamplingParams.image_request_extra_fields() == frozenset(
+        {"img_cfg_scale"}
+    )
 
     extra = params.build_request_extra()[SENSENOVA_U1_REQUEST_EXTRA_KEY]
     assert extra == {
         "cfg_norm": "none",
+        "img_cfg_scale": 1.0,
         "timestep_shift": 3.0,
         "enable_timestep_shift": True,
         "cfg_interval": (0.0, 1.0),
@@ -720,6 +846,8 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
         width=2304,
         height=4096,
         guidance_scale=4.5,
+        img_cfg_scale=2.5,
+        image_path="source.png",
         num_inference_steps=30,
         num_outputs_per_prompt=2,
         cfg_norm="global",
@@ -735,6 +863,8 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     assert cli_args["width"] == 2304
     assert cli_args["height"] == 4096
     assert cli_args["guidance_scale"] == 4.5
+    assert cli_args["img_cfg_scale"] == 2.5
+    assert cli_args["image_path"] == "source.png"
     assert cli_args["num_inference_steps"] == 30
     assert cli_args["num_outputs_per_prompt"] == 2
     assert cli_args["enable_cache_dit"] is True
@@ -788,6 +918,74 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["num_steps"] == 30
     assert model.call_kwargs["batch_size"] == 1
     assert model.call_kwargs["seed"] == 123
+
+
+def test_sensenova_u1_generation_stage_routes_image_inputs_to_it2i():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="make the sky stormy",
+        width=2304,
+        height=4096,
+        guidance_scale=0.5,
+        img_cfg_scale=1.0,
+        image_path=["source-a.png", "source-b.png"],
+        num_inference_steps=30,
+        seed=123,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        image_path=sampling.image_path,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
+    )
+    model = _FakeSenseNovaModel()
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+
+    stage.forward(batch, server_args=_cache_dit_server_args())
+
+    assert model.call_kwargs["images"] == ["source-a.png", "source-b.png"]
+    assert model.call_kwargs["cfg_scale"] == 0.5
+    assert model.call_kwargs["img_cfg_scale"] == 1.0
+
+
+def test_sensenova_u1_forward_remounts_cache_between_t2i_and_it2i(monkeypatch):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    model = _FakeSenseNovaModel()
+    model.language_model = SimpleNamespace(model=transformer)
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = SimpleNamespace(
+        prompt="a mountain lake",
+        width=64,
+        height=64,
+        guidance_scale=1.0,
+        image_path=None,
+        num_inference_steps=8,
+        seed=7,
+        num_outputs_per_prompt=1,
+        extra={SENSENOVA_U1_REQUEST_EXTRA_KEY: {"img_cfg_scale": 1.0}},
+        metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=True, cache_dit_params=None),
+    )
+
+    stage.forward(batch, server_args=_cache_dit_server_args())
+    batch.guidance_scale = 0.5
+    batch.image_path = "source.png"
+    stage.forward(batch, server_args=_cache_dit_server_args())
+
+    assert len(calls["enable"]) == 2
+    assert calls["disable"] == [transformer]
+    assert [call[2]["has_separate_cfg"] for call in calls["enable"]] == [False, True]
+    assert model.call_kwargs["images"] == ["source.png"]
 
 
 def test_sensenova_u1_cache_dit_preserves_config_across_sequential_outputs(

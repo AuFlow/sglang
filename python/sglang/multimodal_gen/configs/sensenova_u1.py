@@ -25,8 +25,28 @@ DEFAULT_CFG_NORM = "none"
 DEFAULT_TIMESTEP_SHIFT = 3.0
 DEFAULT_ENABLE_TIMESTEP_SHIFT = True
 DEFAULT_CFG_INTERVAL = (0.0, 1.0)
+DEFAULT_IMG_CFG_SCALE = 1.0
 DEFAULT_T_EPS = 0.02
 DEFAULT_THINK_MODE = False
+
+
+def derive_cache_branch_count(
+    *, is_edit: bool, cfg_scale: float, img_cfg_scale: float
+) -> int:
+    """Return the stable denoising branch count used by SenseNova generation.
+
+    This deliberately mirrors the generation loops' exact comparisons.  Cache-DiT
+    must not use a tolerance here: a cache profile which differs from the model's
+    real conditional schedule can advance residual state on the wrong branch.
+    """
+    if not is_edit:
+        return 2 if cfg_scale > 1 else 1
+
+    if cfg_scale == 1 and img_cfg_scale == 1:
+        return 1
+    if img_cfg_scale == 1 or cfg_scale == img_cfg_scale:
+        return 2
+    return 3
 
 
 def is_sensenova_u1_model(model_path: str) -> bool:

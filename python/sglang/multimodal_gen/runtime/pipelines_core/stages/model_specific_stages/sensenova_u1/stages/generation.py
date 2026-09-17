@@ -5,16 +5,17 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
-
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_CFG_INTERVAL,
     DEFAULT_CFG_NORM,
     DEFAULT_ENABLE_TIMESTEP_SHIFT,
+    DEFAULT_IMG_CFG_SCALE,
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
+    derive_cache_branch_count,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -61,6 +62,7 @@ class SenseNovaU1GenerationOptions:
     timestep_shift: float = DEFAULT_TIMESTEP_SHIFT
     enable_timestep_shift: bool = DEFAULT_ENABLE_TIMESTEP_SHIFT
     cfg_interval: tuple[float, float] = DEFAULT_CFG_INTERVAL
+    img_cfg_scale: float = DEFAULT_IMG_CFG_SCALE
     t_eps: float = DEFAULT_T_EPS
     think_mode: bool = DEFAULT_THINK_MODE
 
@@ -74,6 +76,7 @@ class SenseNovaU1GenerationOptions:
                 extra.get("enable_timestep_shift", DEFAULT_ENABLE_TIMESTEP_SHIFT)
             ),
             cfg_interval=tuple(extra.get("cfg_interval", DEFAULT_CFG_INTERVAL)),
+            img_cfg_scale=float(extra.get("img_cfg_scale", DEFAULT_IMG_CFG_SCALE)),
             t_eps=float(extra.get("t_eps", DEFAULT_T_EPS)),
             think_mode=bool(extra.get("think_mode", DEFAULT_THINK_MODE)),
         )
@@ -135,20 +138,21 @@ class SenseNovaU1GenerationStage(PipelineStage):
 
     def _cache_dit_blocked_reason(
         self,
-        batch: Req,
         server_args: ServerArgs,
         *,
+        branch_count: int,
         cfg_interval: tuple[float, float],
     ) -> str | None:
         """Why a request that asked for Cache-DiT cannot mount it; None when it can."""
         if server_args.enable_breakable_cuda_graph:
             return "breakable CUDA graphs are enabled"
+        if branch_count > 2:
+            return "three conditioning branches are not supported"
         # cache-dit's separate-CFG context expects a stable pair of forwards
-        # per diffusion step.  SenseNova can gate CFG by timestep, producing
-        # a 1 -> 2 -> 1 call rhythm; do not let that rhythm advance a generic
-        # cache context incorrectly.  Full-interval CFG has a stable pair and
-        # is supported.  A future branch-aware adapter can lift this guard.
-        if float(batch.guidance_scale) > 1.0 and tuple(cfg_interval) != (0.0, 1.0):
+        # per diffusion step.  SenseNova can gate that pair by timestep,
+        # producing a 1 -> 2 -> 1 call rhythm.  Do not let that rhythm advance
+        # a generic cache context incorrectly.
+        if branch_count > 1 and tuple(cfg_interval) != (0.0, 1.0):
             return "timestep-gated CFG is not supported; cfg_interval must be (0, 1)"
         return None
 
@@ -158,15 +162,25 @@ class SenseNovaU1GenerationStage(PipelineStage):
         server_args: ServerArgs,
         *,
         cfg_interval: tuple[float, float],
+        branch_count: int | None = None,
     ) -> None:
         """Mount or refresh the pure-image Cache-DiT path for one request."""
         if self._cache_dit_cleanup_required:
             self._unmount_cache_dit(force=True)
 
+        if branch_count is None:
+            # Private callers from pre-IT2I integration only describe T2I.
+            # The generation entry point always supplies its actual profile.
+            branch_count = derive_cache_branch_count(
+                is_edit=False,
+                cfg_scale=float(batch.guidance_scale),
+                img_cfg_scale=DEFAULT_IMG_CFG_SCALE,
+            )
+
         requested = self._cache_dit_requested(batch)
         if requested:
             blocked_reason = self._cache_dit_blocked_reason(
-                batch, server_args, cfg_interval=cfg_interval
+                server_args, branch_count=branch_count, cfg_interval=cfg_interval
             )
             if blocked_reason is not None:
                 logger.warning_once(
@@ -181,9 +195,9 @@ class SenseNovaU1GenerationStage(PipelineStage):
             self._unmount_cache_dit()
             return
 
-        self._mount_or_refresh_cache_dit(batch)
+        self._mount_or_refresh_cache_dit(batch, branch_count=branch_count)
 
-    def _mount_or_refresh_cache_dit(self, batch: Req) -> None:
+    def _mount_or_refresh_cache_dit(self, batch: Req, *, branch_count: int) -> None:
         """Reuse the mounted Cache-DiT context, or mount one for this request."""
         from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
             CACHE_DIT_DBCACHE_KEYS,
@@ -206,7 +220,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
         # Compare effective settings so omitted and explicit defaults share a mount.
         effective_config = cache_dit_env_defaults()
         effective_config.update(overrides)
-        has_separate_cfg = float(batch.guidance_scale) > 1.0
+        has_separate_cfg = branch_count == 2
         desired_key = (cache_dit_overrides_key(effective_config), has_separate_cfg)
         if self._cache_dit_enabled and desired_key != self._cache_dit_active_key:
             self._unmount_cache_dit()
@@ -268,8 +282,9 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 transformer,
                 config,
                 model_name="sensenova-qwen3-image",
-                # Full-interval CFG issues a stable cond/uncond pair at every
-                # step; timestep-gated CFG was rejected before mounting.
+                # A full-interval two-branch schedule issues a stable pair at
+                # every step; timestep-gated and three-branch schedules were
+                # rejected before mounting.
                 has_separate_cfg=has_separate_cfg,
             )
         except Exception:
@@ -289,21 +304,46 @@ class SenseNovaU1GenerationStage(PipelineStage):
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
 
+    @staticmethod
+    def _prepare_edit_images(batch: Req) -> list[str]:
+        """Normalize image editing inputs without loading them before routing."""
+        image_path = getattr(batch, "image_path", None)
+        if image_path is None:
+            return []
+        if isinstance(image_path, str):
+            return [image_path]
+        if isinstance(image_path, (list, tuple)) and all(
+            isinstance(image, str) for image in image_path
+        ):
+            if not image_path:
+                raise ValueError(
+                    "SenseNova-U1 image editing requires a non-empty image_path."
+                )
+            return list(image_path)
+        raise ValueError("SenseNova-U1 image_path must be a string or list of strings.")
+
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         if int(batch.num_outputs_per_prompt) != 1:
             raise ValueError(
                 "SenseNova-U1 expects output expansion before generation; "
                 f"got num_outputs_per_prompt={batch.num_outputs_per_prompt}."
             )
+        edit_images = self._prepare_edit_images(batch)
         options = SenseNovaU1GenerationOptions.from_batch(batch)
+        branch_count = derive_cache_branch_count(
+            is_edit=bool(edit_images),
+            cfg_scale=float(batch.guidance_scale),
+            img_cfg_scale=options.img_cfg_scale,
+        )
         self._maybe_enable_cache_dit(
-            batch, server_args, cfg_interval=options.cfg_interval
+            batch,
+            server_args,
+            branch_count=branch_count,
+            cfg_interval=options.cfg_interval,
         )
         seed = batch.seed[0] if isinstance(batch.seed, list) else int(batch.seed)
 
-        out = self.model.t2i_generate(
-            self.tokenizer,
-            batch.prompt,
+        generation_kwargs = dict(
             image_size=(int(batch.width), int(batch.height)),
             cfg_scale=float(batch.guidance_scale),
             cfg_norm=options.cfg_norm,
@@ -316,6 +356,18 @@ class SenseNovaU1GenerationStage(PipelineStage):
             think_mode=options.think_mode,
             seed=seed,
         )
+        if edit_images:
+            out = self.model.it2i_generate(
+                self.tokenizer,
+                batch.prompt,
+                edit_images,
+                img_cfg_scale=options.img_cfg_scale,
+                **generation_kwargs,
+            )
+        else:
+            out = self.model.t2i_generate(
+                self.tokenizer, batch.prompt, **generation_kwargs
+            )
         think_text = None
         if options.think_mode:
             images, think_text = out

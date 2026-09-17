@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_CFG_INTERVAL,
     DEFAULT_CFG_NORM,
     DEFAULT_ENABLE_TIMESTEP_SHIFT,
+    DEFAULT_IMG_CFG_SCALE,
     DEFAULT_T_EPS,
     DEFAULT_THINK_MODE,
     DEFAULT_TIMESTEP_SHIFT,
@@ -25,6 +26,8 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "width",
     "num_inference_steps",
     "guidance_scale",
+    "img_cfg_scale",
+    "image_path",
     "num_outputs_per_prompt",
     "seed",
     "save_output",
@@ -47,6 +50,7 @@ class SenseNovaU1SamplingParams(SamplingParams):
     fps: int = 1
     num_inference_steps: int = 50
     guidance_scale: float = 4.0
+    img_cfg_scale: float = DEFAULT_IMG_CFG_SCALE
     cfg_norm: str = DEFAULT_CFG_NORM
     timestep_shift: float = DEFAULT_TIMESTEP_SHIFT
     enable_timestep_shift: bool = DEFAULT_ENABLE_TIMESTEP_SHIFT
@@ -58,6 +62,10 @@ class SenseNovaU1SamplingParams(SamplingParams):
     @classmethod
     def supported_override_fields(cls) -> set[str]:
         return set(_PUBLIC_OVERRIDE_FIELDS)
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset({"img_cfg_scale"})
 
     @classmethod
     def get_cli_args(cls, args):
@@ -105,6 +113,7 @@ class SenseNovaU1SamplingParams(SamplingParams):
         extra = super().build_request_extra()
         extra[SENSENOVA_U1_REQUEST_EXTRA_KEY] = {
             "cfg_norm": self.cfg_norm,
+            "img_cfg_scale": self.img_cfg_scale,
             "timestep_shift": self.timestep_shift,
             "enable_timestep_shift": self.enable_timestep_shift,
             "cfg_interval": tuple(self.cfg_interval),
