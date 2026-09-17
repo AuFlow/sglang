@@ -22,12 +22,12 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
 _PUBLIC_OVERRIDE_FIELDS = {
     "prompt",
     "prompt_path",
+    "image_path",
     "height",
     "width",
     "num_inference_steps",
     "guidance_scale",
     "img_cfg_scale",
-    "image_path",
     "num_outputs_per_prompt",
     "seed",
     "save_output",
@@ -39,6 +39,8 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "enable_cache_dit",
     "cache_dit_params",
 }
+
+MIN_INPUT_MAX_PIXELS = 512 * 512
 
 
 @dataclass
@@ -57,6 +59,8 @@ class SenseNovaU1SamplingParams(SamplingParams):
     cfg_interval: tuple[float, float] = DEFAULT_CFG_INTERVAL
     t_eps: float = DEFAULT_T_EPS
     think_mode: bool = DEFAULT_THINK_MODE
+    input_max_pixels: int | None = None
+    do_resize: bool = True
     negative_prompt: None = field(default=None, init=False)
 
     @classmethod
@@ -101,6 +105,17 @@ class SenseNovaU1SamplingParams(SamplingParams):
                 f"cfg_norm must be one of {SENSENOVA_U1_CFG_NORM_CHOICES}, "
                 f"got {self.cfg_norm!r}"
             )
+        if self.img_cfg_scale < 0:
+            raise ValueError(
+                f"img_cfg_scale must be non-negative, got {self.img_cfg_scale!r}"
+            )
+        if self.input_max_pixels is not None and (
+            self.input_max_pixels < MIN_INPUT_MAX_PIXELS
+        ):
+            raise ValueError(
+                "input_max_pixels must be at least "
+                f"{MIN_INPUT_MAX_PIXELS}, got {self.input_max_pixels!r}"
+            )
         if len(self.cfg_interval) != 2:
             raise ValueError("cfg_interval must contain exactly two values")
         start, end = self.cfg_interval
@@ -119,5 +134,7 @@ class SenseNovaU1SamplingParams(SamplingParams):
             "cfg_interval": tuple(self.cfg_interval),
             "t_eps": self.t_eps,
             "think_mode": self.think_mode,
+            "input_max_pixels": self.input_max_pixels,
+            "do_resize": self.do_resize,
         }
         return extra

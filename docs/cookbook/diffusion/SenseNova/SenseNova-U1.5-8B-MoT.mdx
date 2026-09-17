@@ -109,10 +109,11 @@ sglang generate \
 
 **Advanced usage**
 
-SenseNova-U1 is supported for DBCache only, and only for requests that keep a stable cond/uncond pair per denoising step:
+SenseNova-U1 is supported for DBCache only, and only for requests that keep a stable one- or two-branch denoising schedule:
 
 - **DBCache knobs only.** `--cache-dit-params` accepts `Fn_compute_blocks`, `Bn_compute_blocks`, `max_warmup_steps`, `residual_diff_threshold`, and `max_continuous_cached_steps`. TaylorSeer and SCM keys are rejected with an error.
-- **Full-interval CFG only.** With `--guidance-scale` above `1.0`, Cache-DiT is skipped unless `cfg_interval` stays `(0, 1)`. Timestep-gated CFG produces a varying number of forwards per step, which the cache context cannot track.
+- **Full-interval guidance only.** When generation uses two conditioning branches, Cache-DiT is skipped unless `cfg_interval` stays `(0, 1)`. Timestep-gated guidance produces a varying number of forwards per step, which the cache context cannot track.
+- **At most two editing branches.** Image-edit configurations that require three conditioning branches run without Cache-DiT. One- and two-branch edit schedules are supported, including `guidance_scale < 1` with the default `img_cfg_scale=1`.
 - **Breakable CUDA graphs win.** Under `--enable-breakable-cuda-graph` the per-request Cache-DiT switch is ignored and a warning is logged.
 
 SenseNova's text, prefix, and Think forwards share the Qwen3 decoder with the image denoising pass. Only the image denoising pass is wrapped, so enabling the cache does not change prompt understanding or the Think text.
@@ -132,11 +133,32 @@ export SGLANG_CACHE_DIT_MC=1
 
 This preset computes more transformer blocks, uses a longer warmup, applies a stricter residual threshold, and limits consecutive cached steps. It prioritizes text and layout fidelity over maximum acceleration. Treat it as a starting point and validate output quality on your target prompts.
 
+### 4.3 Edit an Image
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+response = client.images.edit(
+    model="sensenova/SenseNova-U1.5-8B-MoT",
+    image=open("image_google.png", "rb"),
+    prompt='Replace the text "Google" with "Goose".',
+    n=1,
+    response_format="url",
+    extra_body={
+        "seed": 42,
+        "guidance_scale": 4.0,
+        "num_inference_steps": 50,
+    },
+)
+```
+
 ## 5. Benchmark
 
 ### 5.1 Speedup Benchmark
 
-#### 5.1.1 Single-run Profile
+#### 5.1.1 Generate an Image
 
 <Tabs>
   <Tab title="NVIDIA A800">
@@ -192,3 +214,53 @@ This preset computes more transformer blocks, uses a longer warmup, applies a st
     ```
   </Tab>
 </Tabs>
+
+#### 5.1.2 Edit an Image
+
+**Server Command**:
+
+```shell Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --port 30000
+```
+
+**Benchmark Command**:
+
+```shell Command
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+  --dataset vbench \
+  --task image-to-image \
+  --num-prompts 1 \
+  --max-concurrency 1 \
+  --port 30000
+```
+
+**Result**:
+
+```text Output
+================= Serving Benchmark Result =================
+Task:                                         image-to-image
+Model:                                        /model/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT
+Dataset:                                      vbench
+--------------------------------------------------
+Benchmark duration (s):                       55.73
+Request rate:                                 inf
+Max request concurrency:                      1
+Successful requests:                          1/1
+Completed outputs:                            1
+Outputs per prompt:                           1
+--------------------------------------------------
+Request throughput (req/s):                   0.02
+Output throughput (outputs/s):                0.02
+Latency Mean (s):                             55.73
+Latency Median (s):                           55.73
+Latency P90 (s):                              55.73
+Latency P95 (s):                              55.73
+Latency P99 (s):                              55.73
+--------------------------------------------------
+Peak Memory Max (MB):                         41554.00
+Peak Memory Mean (MB):                        41554.00
+Peak Memory Median (MB):                      41554.00
+------------------------------------------------------------
+```

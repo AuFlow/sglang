@@ -4,6 +4,8 @@
 import json
 import os
 
+from PIL import Image
+
 SENSENOVA_U1_REQUEST_EXTRA_KEY = "sensenova_u1"
 
 SENSENOVA_U1_MODEL_IDS = {
@@ -47,6 +49,14 @@ def derive_cache_branch_count(
     if img_cfg_scale == 1 or cfg_scale == img_cfg_scale:
         return 2
     return 3
+
+
+def _flatten_rgba_to_rgb(image: Image.Image) -> Image.Image:
+    if image.mode != "RGBA":
+        return image.convert("RGB")
+    background = Image.new("RGB", image.size, (255, 255, 255))
+    background.paste(image, mask=image.split()[3])
+    return background
 
 
 def is_sensenova_u1_model(model_path: str) -> bool:
