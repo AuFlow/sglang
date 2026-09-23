@@ -618,6 +618,22 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def _resolve_shared_rope_attention(layer):
+    self_attn = getattr(layer, "self_attn", None)
+    if self_attn is not None and hasattr(self_attn, "_resolve_rope_tables"):
+        return self_attn
+
+    if isinstance(layer, nn.Module):
+        for module in layer.modules():
+            if module is layer:
+                continue
+            self_attn = getattr(module, "self_attn", None)
+            if self_attn is not None and hasattr(self_attn, "_resolve_rope_tables"):
+                return self_attn
+
+    return None
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -1889,9 +1905,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # normalization changes the activation dtype.
         position_embeddings = None
         if layers:
-            position_embeddings = layers[0].self_attn._resolve_rope_tables(
-                indexes, hidden_states
-            )
+            rope_attention = _resolve_shared_rope_attention(layers[0])
+            if rope_attention is not None:
+                position_embeddings = rope_attention._resolve_rope_tables(
+                    indexes, hidden_states
+                )
 
         for decoder_layer in layers[: self.config.num_hidden_layers]:
             attention_type = cache_dit_attention_type(self, decoder_layer)
