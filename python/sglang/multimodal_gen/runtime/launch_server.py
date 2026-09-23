@@ -146,14 +146,11 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         configure_metrics()
     logger.info("Starting server...")
 
-    # num_gpus is the total world size across every node; each node runs
-    # its own num_gpus // nnodes local workers, offset by node_rank into the
-    # global rank space (mirrors srt's tp_size_per_node convention). With
-    # nnodes == 1 this is exactly the prior single-node arithmetic.
-    num_gpus = server_args.num_gpus
-    nnodes = server_args.nnodes
+    # get_local_gpu_ids resolves the node-local logical devices from the global
+    # world size. Offset them by node_rank to obtain their global ranks.
     node_rank = server_args.node_rank
-    local_num_gpus = num_gpus // nnodes
+    local_gpu_ids = server_args.get_local_gpu_ids()
+    local_num_gpus = len(local_gpu_ids)
     rank_offset = node_rank * local_num_gpus
     processes = []
 
@@ -171,7 +168,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         reader, writer = worker_context.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
         spec = SchedulerProcessSpec(
-            local_rank=i,
+            local_rank=local_gpu_ids[i],
             rank=rank,
             server_args=server_args_payload,
             pipe_writer=writer,
@@ -364,6 +361,7 @@ def launch_pool_disagg_server(
                 "pool_work_endpoint": work_eps[inst_idx],
                 "pool_result_endpoint": result_ep,
                 "num_gpus": num_role_gpus,
+                "gpu_ids": gpu_ids,
                 "warmup_mode": "request" if role_type == RoleType.ENCODER else "off",
                 "scheduler_port": find_port(port_cursor),
                 "master_port": find_port(port_cursor + 100),
@@ -709,15 +707,15 @@ def launch_disagg_role(server_args: ServerArgs):
     # Spawn GPU worker processes
     # NOTE: All ranks must be spawned before waiting for ready signals,
     # because NCCL init_process_group blocks until all ranks connect.
-    num_gpus = server_args.num_gpus
-    base_gpu_id = server_args.base_gpu_id
+    worker_gpu_ids = server_args.get_local_gpu_ids()
+    num_gpus = len(worker_gpu_ids)
     pool_ctx = mp.get_context("spawn")
     processes = []
     readers = []
 
     for rank_idx in range(num_gpus):
         reader, writer = pool_ctx.Pipe(duplex=False)
-        gpu_id = base_gpu_id + rank_idx
+        gpu_id = worker_gpu_ids[rank_idx]
 
         # Physical GPU index as local_rank: torch.cuda.set_device() must not
         # depend on CUDA_VISIBLE_DEVICES remapping, which can be stale if CUDA
