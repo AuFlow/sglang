@@ -2,6 +2,8 @@
 
 import copy
 import os
+import warnings
+import weakref
 from typing import Callable, Optional, Union
 
 import torch
@@ -42,6 +44,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.layers.layernorm import RMSNorm
 
 from .transformers_compat import (
@@ -72,6 +75,20 @@ _ATTN_BACKEND: str = "auto"
 _SENSENOVA_NPU_FUSED_ROPE_ENV = "SGLANG_SENSENOVA_NPU_FUSED_ROPE"
 _SENSENOVA_NPU_FUSED_ROPE_ROTARY_MUL = {"1", "true", "on", "rotary_mul", "mul"}
 _SENSENOVA_NPU_ROTARY_MUL_DISABLED = False
+_SENSENOVA_NPU_GRAPH_ENV = "SGLANG_SENSENOVA_NPU_GRAPH"
+_SENSENOVA_NPU_GRAPH_ENABLED_VALUES = {"1", "true", "on", "yes"}
+_SENSENOVA_NPU_GRAPH_DISABLED = False
+_SENSENOVA_NPU_GRAPH_CAPTURE_REPORTED = False
+_SENSENOVA_NPU_GRAPH_POOLS: dict[int, object] = {}
+_SENSENOVA_NPU_GRAPH_LAYERS: weakref.WeakSet = weakref.WeakSet()
+
+
+def _sensenova_npu_graph_enabled() -> bool:
+    return (
+        not _SENSENOVA_NPU_GRAPH_DISABLED
+        and os.getenv(_SENSENOVA_NPU_GRAPH_ENV, "0").strip().lower()
+        in _SENSENOVA_NPU_GRAPH_ENABLED_VALUES
+    )
 
 
 def _linear_output(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -481,8 +498,12 @@ class Qwen3MLP(nn.Module):
 
     def forward(self, x):
         if self._use_npu_fused_mlp(x):
-            gate_up = F.linear(x, self._pack_npu_gate_up_weights())
-            return _linear_output(self.down_proj, torch.ops.npu.npu_swiglu(gate_up))
+            with maybe_record_function("sensenova.mlp_gate_up"):
+                gate_up = F.linear(x, self._pack_npu_gate_up_weights())
+            with maybe_record_function("sensenova.mlp_swiglu"):
+                gate_up = torch.ops.npu.npu_swiglu(gate_up)
+            with maybe_record_function("sensenova.mlp_down"):
+                return _linear_output(self.down_proj, gate_up)
         gate = _linear_output(self.gate_proj, x)
         up = _linear_output(self.up_proj, x)
         down_proj = _linear_output(self.down_proj, self.act_fn(gate) * up)
@@ -971,23 +992,24 @@ class Qwen3Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = _linear_output(self.q_proj, hidden_states).view(hidden_shape)
-        query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
-        query_states_t = self.q_norm(query_states_t).transpose(1, 2)
-        query_states_hw = self.q_norm_hw(query_states_hw).transpose(1, 2)
-        query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
+        with maybe_record_function("sensenova.qkv_projection"):
+            query_states = _linear_output(self.q_proj, hidden_states).view(hidden_shape)
+            query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
+            query_states_t = self.q_norm(query_states_t).transpose(1, 2)
+            query_states_hw = self.q_norm_hw(query_states_hw).transpose(1, 2)
+            query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
 
-        key_states = _linear_output(self.k_proj, hidden_states).view(hidden_shape)
-        key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
-        key_states_t = self.k_norm(key_states_t).transpose(1, 2)
-        key_states_hw = self.k_norm_hw(key_states_hw).transpose(1, 2)
-        key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
+            key_states = _linear_output(self.k_proj, hidden_states).view(hidden_shape)
+            key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
+            key_states_t = self.k_norm(key_states_t).transpose(1, 2)
+            key_states_hw = self.k_norm_hw(key_states_hw).transpose(1, 2)
+            key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
 
-        value_states = (
-            _linear_output(self.v_proj, hidden_states)
-            .view(hidden_shape)
-            .transpose(1, 2)
-        )
+            value_states = (
+                _linear_output(self.v_proj, hidden_states)
+                .view(hidden_shape)
+                .transpose(1, 2)
+            )
 
         (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self._resolve_rope_tables(
             indexes, hidden_states, position_embeddings
@@ -1033,20 +1055,22 @@ class Qwen3Attention(nn.Module):
                 self.config._attn_implementation
             ]
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
+        with maybe_record_function("sensenova.fia_attention"):
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,  # diff with Llama
+                **kwargs,
+            )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = _linear_output(self.o_proj, attn_output)
+        with maybe_record_function("sensenova.o_projection"):
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = _linear_output(self.o_proj, attn_output)
         return attn_output, attn_weights
 
     # def forward_gen(
@@ -1650,6 +1674,11 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.attention_type = config.layer_types[layer_idx]
+        # Entries are request-local in practice because their key includes the
+        # prefix-cache object identity. Keep at most the condition and
+        # uncondition graphs; a new request replaces both.
+        self._sensenova_npu_graph_entries: dict[tuple, dict] = {}
+        _SENSENOVA_NPU_GRAPH_LAYERS.add(self)
 
     def forward_und(
         self,
@@ -1692,7 +1721,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
         return hidden_states
 
-    def forward_gen(
+    def _forward_gen_eager(
         self,
         hidden_states: torch.Tensor,
         image_gen_indicators: torch.Tensor,
@@ -1732,6 +1761,158 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp_mot_gen(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
+
+    def forward_gen(
+        self,
+        hidden_states: torch.Tensor,
+        image_gen_indicators: torch.Tensor,
+        exist_non_image_gen_tokens: bool,
+        exist_image_gen_tokens: bool,
+        indexes: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[PositionEmbeddings] = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        global _SENSENOVA_NPU_GRAPH_CAPTURE_REPORTED
+        global _SENSENOVA_NPU_GRAPH_DISABLED
+
+        def eager_forward(x: torch.Tensor) -> torch.Tensor:
+            return self._forward_gen_eager(
+                x,
+                image_gen_indicators,
+                exist_non_image_gen_tokens,
+                exist_image_gen_tokens,
+                indexes,
+                attention_mask,
+                position_ids,
+                past_key_values,
+                use_cache,
+                cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+        if not _sensenova_npu_graph_enabled():
+            if self._sensenova_npu_graph_entries:
+                self._sensenova_npu_graph_entries.clear()
+            return eager_forward(hidden_states)
+
+        profiler_enabled = getattr(
+            torch.autograd.profiler, "_is_profiler_enabled", False
+        )
+        if callable(profiler_enabled):
+            profiler_enabled = profiler_enabled()
+        can_capture = (
+            hidden_states.device.type == "npu"
+            and hidden_states.dtype == torch.bfloat16
+            and not self.training
+            and not torch.is_grad_enabled()
+            and not profiler_enabled
+            and past_key_values is not None
+            and get_tp_world_size() == 1
+            and get_sp_world_size() == 1
+            and hasattr(torch.npu, "NPUGraph")
+            and hasattr(torch.npu, "graph")
+        )
+        if not can_capture:
+            return eager_forward(hidden_states)
+
+        key = (
+            id(past_key_values),
+            tuple(hidden_states.shape),
+            tuple(hidden_states.stride()),
+            hidden_states.dtype,
+            hidden_states.device.index,
+        )
+        try:
+            entry = self._sensenova_npu_graph_entries.get(key)
+            if entry is None:
+                if len(self._sensenova_npu_graph_entries) >= 2:
+                    self._sensenova_npu_graph_entries.clear()
+                entry = {
+                    "warmup_complete": False,
+                    "graph": None,
+                    # Retain the first eager input as the graph's fixed-address
+                    # input. Allocating an additional activation-sized static
+                    # buffer can fail on memory-tight NPU deployments, and
+                    # some torch_npu versions report that failure as an
+                    # impossible exabyte-sized allocation.
+                    "static_input": hidden_states.detach(),
+                }
+                # Retain every tensor/object whose address is captured by the graph.
+                entry["captured_state"] = (
+                    image_gen_indicators,
+                    indexes,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    cache_position,
+                    position_embeddings,
+                    kwargs,
+                )
+                self._sensenova_npu_graph_entries[key] = entry
+
+            if entry["graph"] is not None:
+                entry["static_input"].copy_(hidden_states)
+                entry["graph"].replay()
+                # Cache-DiT may retain a layer output across denoising steps. A
+                # graph output has a fixed address and is overwritten on replay,
+                # so copy it into the eager warmup output retained outside the
+                # graph pool. Reusing that buffer avoids an activation-sized
+                # allocation on every replay.
+                entry["return_buffer"].copy_(entry["static_output"])
+                return entry["return_buffer"]
+
+            if not entry["warmup_complete"]:
+                entry["warmup_complete"] = True
+                eager_output = eager_forward(hidden_states)
+                entry["return_buffer"] = eager_output
+                return eager_output
+
+            static_input = entry["static_input"]
+            static_input.copy_(hidden_states)
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            device_index = hidden_states.device.index or 0
+            graph_pool = _SENSENOVA_NPU_GRAPH_POOLS.get(device_index)
+            if graph_pool is None and hasattr(torch.npu, "graph_pool_handle"):
+                graph_pool = torch.npu.graph_pool_handle()
+                _SENSENOVA_NPU_GRAPH_POOLS[device_index] = graph_pool
+            graph_kwargs = {} if graph_pool is None else {"pool": graph_pool}
+            with torch.npu.graph(graph, **graph_kwargs):
+                static_output = eager_forward(static_input)
+            entry["graph"] = graph
+            entry["graph_pool"] = graph_pool
+            entry["static_output"] = static_output
+            if not _SENSENOVA_NPU_GRAPH_CAPTURE_REPORTED:
+                warnings.warn(
+                    "SenseNova NPU graph capture is active for denoising decoder "
+                    "layers.",
+                    stacklevel=2,
+                )
+                _SENSENOVA_NPU_GRAPH_CAPTURE_REPORTED = True
+            entry["return_buffer"].copy_(static_output)
+            return entry["return_buffer"]
+        except Exception as exc:
+            _SENSENOVA_NPU_GRAPH_DISABLED = True
+            # A partially captured per-layer graph can retain a large allocator
+            # pool. Drop every layer's graph together so eager fallback has
+            # enough memory to continue serving requests.
+            for layer in list(_SENSENOVA_NPU_GRAPH_LAYERS):
+                layer._sensenova_npu_graph_entries.clear()
+            _SENSENOVA_NPU_GRAPH_POOLS.clear()
+            if hidden_states.device.type == "npu":
+                torch.npu.empty_cache()
+            warnings.warn(
+                "SenseNova NPU graph capture failed and was disabled for this "
+                f"process; falling back to eager execution: {exc}",
+                stacklevel=2,
+            )
+            return eager_forward(hidden_states)
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
