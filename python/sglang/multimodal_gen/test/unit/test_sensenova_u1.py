@@ -1824,6 +1824,19 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert len(model.t2i_calls) == 1
     assert model.it2i_calls == []
 
+    tokenizing_stage = SenseNovaU1GenerationStage(
+        model=_FakeSenseNovaModel(),
+        tokenizer=lambda text, **kwargs: {"input_ids": text.split()},
+    )
+    tokenized_output = tokenizing_stage.forward(
+        batch, server_args=_cache_dit_server_args()
+    )
+    assert tokenized_output.usage == {
+        "input_tokens_details": {"text_tokens": 3, "image_tokens": 0},
+        "input_tokens": 3,
+        "total_tokens": 3,
+    }
+
 
 def test_sensenova_u1_generation_stage_uses_it2i_for_image_inputs():
     sampling = SenseNovaU1SamplingParams(
@@ -2801,6 +2814,7 @@ def test_sensenova_it2i_guidance_profile_drives_real_loop_branches(
     )
     tokenizer = SimpleNamespace(convert_tokens_to_ids=lambda _token: 0)
 
+    token_usage = {}
     output = NEOChatModel.it2i_generate(
         model,
         tokenizer,
@@ -2812,6 +2826,7 @@ def test_sensenova_it2i_guidance_profile_drives_real_loop_branches(
         img_cfg_scale=img_cfg_scale,
         cfg_interval=cfg_interval,
         enable_timestep_shift=False,
+        usage=token_usage,
     )
 
     expected_by_step = [
@@ -2824,6 +2839,7 @@ def test_sensenova_it2i_guidance_profile_drives_real_loop_branches(
     ]
     assert actual_by_step == expected_by_step
     assert output.shape == (1, 3, 2, 2)
+    assert token_usage["image_tokens"] == 1
 
 
 @pytest.mark.parametrize("enabled", [False, True])

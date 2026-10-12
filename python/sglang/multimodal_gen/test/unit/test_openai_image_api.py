@@ -17,6 +17,7 @@ from sglang.multimodal_gen.configs.sample.longcat_image import (
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
+    _common_image_size,
     _fallback_image_urls,
     _get_response_resize,
     _image_request_model_kwargs,
@@ -28,6 +29,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
+    ImageResponse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
@@ -37,7 +39,7 @@ def test_image_edits_declares_perf_dump_path_form_field():
 
 
 def test_url_response_returns_one_item_per_output_path():
-    paths = ["first.png", "second.png"]
+    paths = ["first.png", "second.jpg"]
 
     response = _build_image_response_kwargs(
         paths,
@@ -56,8 +58,10 @@ def test_url_response_returns_one_item_per_output_path():
     ]
     assert [item.file_path for item in response["data"]] == [
         os.path.abspath("first.png"),
-        os.path.abspath("second.png"),
+        os.path.abspath("second.jpg"),
     ]
+    assert [item.output_format for item in response["data"]] == ["png", "jpeg"]
+    assert response["usage"]["image_count"] == 2
 
 
 def test_runtime_sampling_quality_preserves_the_openai_default():
@@ -159,6 +163,47 @@ def test_image_response_includes_resize_for_every_output():
         "1280x736",
         "1280x736",
     ]
+    assert [item.output_format for item in response["data"]] == ["png", "png"]
+    assert response["usage"]["image_count"] == 2
+
+
+def test_image_response_preserves_sensenova_usage_and_final_size():
+    response = _build_image_response_kwargs(
+        ["output.png"],
+        "b64_json",
+        "a lantern",
+        "req-123",
+        OutputBatch(
+            usage={
+                "total_tokens": 3,
+                "input_tokens": 3,
+                "input_tokens_details": {"text_tokens": 3, "image_tokens": 1024},
+            }
+        ),
+        b64_list=["aGVsbG8="],
+        image_size=(2048, 2048),
+    )
+
+    usage = ImageResponse(**response).model_dump()["usage"]
+    assert usage["total_tokens"] == usage["input_tokens"] == 3
+    assert usage["input_tokens_details"] == {
+        "text_tokens": 3,
+        "image_tokens": 1024,
+    }
+    assert (usage["image_count"], usage["width"], usage["height"]) == (
+        1,
+        2048,
+        2048,
+    )
+
+
+def test_common_image_size_reads_final_files(tmp_path):
+    paths = [tmp_path / "first.png", tmp_path / "second.png"]
+    for path in paths:
+        Image.new("RGB", (64, 32)).save(path)
+    assert _common_image_size([str(path) for path in paths]) == (64, 32)
+    Image.new("RGB", (32, 64)).save(paths[1])
+    assert _common_image_size([str(path) for path in paths]) is None
 
 
 def test_response_resize_is_only_populated_for_glm_image():

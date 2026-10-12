@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class ImageResponseData(BaseModel):
     b64_json: Optional[str] = None
     url: Optional[str] = None
+    output_format: Optional[str] = None
     revised_prompt: Optional[str] = None
     file_path: Optional[str] = None
     resize: Optional[str] = None
@@ -20,13 +21,22 @@ class ImagePromptTokensDetails(BaseModel):
     cached_tokens: int = 0
 
 
+class ImageInputTokensDetails(BaseModel):
+    text_tokens: Optional[int] = None
+    image_tokens: Optional[int] = None
+
+
 class ImageUsage(BaseModel):
+    input_tokens: Optional[int] = None
+    input_tokens_details: Optional[ImageInputTokensDetails] = None
     prompt_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     prompt_tokens_details: Optional[ImagePromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
     image_count: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
 
 
 class ImageResponse(BaseModel):

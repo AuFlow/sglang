@@ -2150,6 +2150,7 @@ class NEOChatModel(PreTrainedModel):
         think_mode=False,
         seed=0,
         generators=None,
+        usage=None,
     ):
         assert cfg_norm in ["none", "global", "channel"]
         self._notify_layer_offload_phase("prefix")
@@ -2226,6 +2227,12 @@ class NEOChatModel(PreTrainedModel):
                 query_img_condition = query_img_condition.replace(
                     "<image>", image_tokens, 1
                 )
+
+        if usage is not None:
+            usage["image_tokens"] = sum(
+                int(grid_hw[i, 0] * grid_hw[i, 1] * self.downsample_ratio**2)
+                for i in range(grid_hw.shape[0])
+            )
 
         input_embeds_condition, indexes_condition, attention_mask_condition_prefix = (
             self._build_it2i_inputs(tokenizer, query_condition, pixel_values, grid_hw)
@@ -2633,6 +2640,7 @@ class NEOChatModel(PreTrainedModel):
         think_mode=False,
         seed=0,
         generators=None,
+        usage=None,
     ):
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]

@@ -415,9 +415,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 else None
             )
             tp_group = (
-                get_tp_group().device_group
-                if (server_args.tp_size or 1) > 1
-                else None
+                get_tp_group().device_group if (server_args.tp_size or 1) > 1 else None
             )
             enable_cache_on_transformer(
                 transformer,
@@ -530,6 +528,13 @@ class SenseNovaU1GenerationStage(PipelineStage):
             think_mode=options.think_mode,
             generators=generators,
         )
+        token_usage = {}
+        if callable(self.tokenizer):
+            token_usage["text_tokens"] = sum(
+                len(self.tokenizer(prompt, add_special_tokens=False)["input_ids"])
+                for prompt in prompts
+            )
+        common_kwargs["usage"] = token_usage
         with set_forward_context(
             current_timestep=0, attn_metadata=None, forward_batch=batch
         ):
@@ -555,7 +560,18 @@ class SenseNovaU1GenerationStage(PipelineStage):
 
         images = _denorm_sensenova_output(images)
         samples = [sample.contiguous() for sample in images]
-        usage = {"think_text": think_text} if think_text is not None else None
+        text_tokens = token_usage.get("text_tokens")
+        usage = {
+            "input_tokens_details": {
+                "text_tokens": text_tokens,
+                "image_tokens": token_usage.get("image_tokens", 0),
+            },
+        }
+        if text_tokens is not None:
+            usage["input_tokens"] = text_tokens
+            usage["total_tokens"] = text_tokens
+        if think_text is not None:
+            usage["think_text"] = think_text
         return OutputBatch(
             output=samples,
             metrics=batch.metrics,

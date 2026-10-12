@@ -92,6 +92,22 @@ def _read_b64_for_paths(paths: list[str]) -> list[str]:
     return result
 
 
+def _image_output_format(path: str) -> str | None:
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    return "jpeg" if ext in {"jpg", "jpeg"} else ext or None
+
+
+def _common_image_size(paths: list[str]) -> tuple[int, int] | None:
+    sizes = []
+    for path in paths:
+        try:
+            with Image.open(path) as image:
+                sizes.append(image.size)
+        except (OSError, ValueError):
+            return None
+    return sizes[0] if sizes and all(size == sizes[0] for size in sizes) else None
+
+
 async def _upload_and_cleanup_images(paths: list[str]) -> list[str | None]:
     return await asyncio.gather(
         *(cloud_storage.upload_and_cleanup(path) for path in paths)
@@ -172,6 +188,7 @@ def _build_image_response_kwargs(
     fallback_urls: list[str] | None = None,
     is_persistent: bool = True,
     resize: str | None = None,
+    image_size: tuple[int, int] | None = None,
 ) -> dict:
     """Build ImageResponse data list.
 
@@ -186,6 +203,7 @@ def _build_image_response_kwargs(
         data = [
             ImageResponseData(
                 b64_json=b64,
+                output_format=_image_output_format(path),
                 revised_prompt=prompt,
                 file_path=os.path.abspath(path) if is_persistent else None,
                 resize=resize,
@@ -211,6 +229,7 @@ def _build_image_response_kwargs(
             data.append(
                 ImageResponseData(
                     url=url,
+                    output_format=_image_output_format(path),
                     revised_prompt=prompt,
                     file_path=os.path.abspath(path) if is_persistent else None,
                     resize=resize,
@@ -229,8 +248,9 @@ def _build_image_response_kwargs(
         )
 
     ret = add_common_data_to_response(ret, request_id=request_id, result=result)
-    if ret.get("usage") is not None:
-        ret["usage"]["image_count"] = len(save_file_path_list)
+    ret.setdefault("usage", {})["image_count"] = len(save_file_path_list)
+    if image_size is not None:
+        ret["usage"]["width"], ret["usage"]["height"] = image_size
 
     return ret
 
@@ -340,6 +360,7 @@ async def generations(
         )
         save_file_path = save_file_path_list[0]
         response_resize = _get_response_resize(sampling, save_file_path)
+        image_size = _common_image_size(save_file_path_list)
         response_format = request.response_format
         if "response_format" not in request.model_fields_set:
             response_format = (
@@ -391,6 +412,7 @@ async def generations(
             fallback_urls=fallback_urls,
             is_persistent=is_persistent,
             resize=response_resize,
+            image_size=image_size,
         )
 
     return ImageResponse(**response_kwargs)
@@ -500,6 +522,7 @@ async def edits(
         )
         save_file_path = save_file_path_list[0]
         response_resize = _get_response_resize(sampling, save_file_path)
+        image_size = _common_image_size(save_file_path_list)
         resp_format = (response_format or "b64_json").lower()
 
         # read b64 before cloud upload may delete the local file
@@ -549,6 +572,7 @@ async def edits(
             fallback_urls=fallback_urls,
             is_persistent=is_persistent,
             resize=response_resize,
+            image_size=image_size,
         )
 
     return ImageResponse(**response_kwargs)
