@@ -5,7 +5,7 @@ import base64
 import contextlib
 import os
 import time
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 from fastapi import (
     APIRouter,
@@ -429,7 +429,7 @@ async def edits(
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
-    response_format: Optional[str] = Form(None),
+    response_format: Literal["b64_json"] = Form("b64_json"),
     size: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     background: Optional[str] = Form("auto"),

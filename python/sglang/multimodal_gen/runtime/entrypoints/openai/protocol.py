@@ -59,7 +59,7 @@ class ImageGenerationsRequest(BaseModel):
     model: Optional[str] = None
     n: Optional[int] = 1
     quality: Optional[str] = "auto"
-    response_format: Optional[str] = "url"  # url | b64_json
+    response_format: Literal["b64_json"] = "b64_json"
     size: Optional[str] = "1024x1024"  # e.g., 1024x1024
     style: Optional[str] = "vivid"
     background: Optional[str] = "auto"  # transparent | opaque | auto
