@@ -97,6 +97,7 @@ from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
+from sglang.logging_utils import configure_root_logger, configure_uvicorn_streams
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
@@ -2137,7 +2138,11 @@ def configure_hf_hub_logger():
 
     # CLI model detection can contact Hub before configure_logger runs.
     # basicConfig leaves any existing application logging setup intact.
-    logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    configure_root_logger(
+        logging.getLogger().level,
+        logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"),
+        force=False,
+    )
     hub_logger = hf_logging.get_logger()
     for handler in hub_logger.handlers[:]:
         # Hub installs a plain StreamHandler and also propagates to the root.
@@ -2454,13 +2459,11 @@ def configure_logger(server_args, prefix: str = ""):
         return
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
     format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
-    logging.basicConfig(
-        # Runs before publish, and for multimodal_gen's ServerArgs, which
-        # never publishes these bags -- so the record, not the bag.
-        level=getattr(logging, server_args.log_level.upper()),
-        format=format,
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
+    # Runs before publish, and for multimodal_gen's ServerArgs, which
+    # never publishes these bags -- so the record, not the bag.
+    configure_root_logger(
+        getattr(logging, server_args.log_level.upper()),
+        logging.Formatter(format, datefmt="%Y-%m-%d %H:%M:%S"),
     )
 
     configure_hf_hub_logger()
@@ -3440,6 +3443,8 @@ class UvicornAccessLogFilter(logging.Filter):
 
 def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
+
+    configure_uvicorn_streams(LOGGING_CONFIG)
 
     LOGGING_CONFIG["formatters"]["default"]["fmt"] = (
         "[%(asctime)s] %(levelprefix)s %(message)s"

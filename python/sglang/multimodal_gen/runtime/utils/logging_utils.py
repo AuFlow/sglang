@@ -21,6 +21,7 @@ from types import MethodType
 from typing import Any, cast
 
 import sglang.multimodal_gen.envs as envs
+from sglang.logging_utils import configure_root_logger, configure_uvicorn_streams
 
 SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
 SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
@@ -491,6 +492,8 @@ def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
 def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
+    configure_uvicorn_streams(LOGGING_CONFIG)
+
     LOGGING_CONFIG["formatters"]["default"]["fmt"] = (
         "[%(asctime)s] %(levelprefix)s %(message)s"
     )
@@ -570,13 +573,7 @@ def configure_logger(server_args, prefix: str = ""):
     datefmt = "%m-%d %H:%M:%S"
 
     formatter = ColoredFormatter(log_format, datefmt=datefmt)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(formatter)
-
-    root = logging.getLogger()
-    root.handlers.clear()
-    root.addHandler(handler)
-    root.setLevel(getattr(logging, server_args.log_level.upper()))
+    configure_root_logger(getattr(logging, server_args.log_level.upper()), formatter)
 
     set_uvicorn_logging_configs(server_args)
 

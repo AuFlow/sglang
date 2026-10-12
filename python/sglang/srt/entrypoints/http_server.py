@@ -2745,7 +2745,7 @@ def _setup_and_run_http_server(
             from uvicorn.config import LOGGING_CONFIG
 
             LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
-                "handlers": ["default"],
+                "handlers": LOGGING_CONFIG["loggers"]["uvicorn"]["handlers"][:],
                 "level": "INFO",
                 "propagate": False,
             }
