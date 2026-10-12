@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImageResponse,
     ImageResponseData,
+    ImageSize,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
@@ -430,7 +431,7 @@ async def edits(
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     response_format: Literal["b64_json"] = Form("b64_json"),
-    size: Optional[str] = Form(None),
+    size: Optional[ImageSize] = Form(None),
     output_format: Optional[str] = Form(None),
     background: Optional[str] = Form("auto"),
     seed: Optional[int] = Form(None),

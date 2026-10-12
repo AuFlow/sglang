@@ -2,9 +2,26 @@ import time
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+
+
+def _validate_image_size(size: str) -> str:
+    try:
+        width, height = map(int, size.lower().replace(" ", "").split("x"))
+    except ValueError as exc:
+        raise ValueError("size must be formatted as WIDTHxHEIGHT") from exc
+    if any(value < 1024 or value > 4096 or value % 32 for value in (width, height)):
+        raise ValueError(
+            "Image width and height must be between 1024 and 4096 "
+            "and multiples of 32"
+        )
+    return size
+
+
+ImageSize = Annotated[str, AfterValidator(_validate_image_size)]
+ImageDimension = Annotated[int, Field(ge=1024, le=4096, multiple_of=32)]
 
 
 # Image API protocol models
@@ -60,14 +77,14 @@ class ImageGenerationsRequest(BaseModel):
     n: Optional[int] = 1
     quality: Optional[str] = "auto"
     response_format: Literal["b64_json"] = "b64_json"
-    size: Optional[str] = "1024x1024"  # e.g., 1024x1024
+    size: Optional[ImageSize] = "1024x1024"
     style: Optional[str] = "vivid"
     background: Optional[str] = "auto"  # transparent | opaque | auto
     output_format: Optional[str] = None  # png | jpeg | webp
     user: Optional[str] = None
     # SGLang extensions
-    width: Optional[int] = None
-    height: Optional[int] = None
+    width: Optional[ImageDimension] = None
+    height: Optional[ImageDimension] = None
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     true_cfg_scale: Optional[float] = (
