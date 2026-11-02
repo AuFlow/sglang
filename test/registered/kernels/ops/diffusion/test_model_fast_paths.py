@@ -2350,10 +2350,10 @@ def test_moss_image_rmsnorm_verifies_each_regime_and_preserves_graph_capture(
 
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
-@pytest.mark.parametrize("epilogue", ["modulate", "rope"])
+@pytest.mark.parametrize("epilogue", ["modulate", "rope", "paired_rope"])
 def test_moss_image_norm_epilogue_gate_and_graph_replay(monkeypatch, epilogue):
     import sglang.multimodal_gen.runtime.models.dits.moss_image as moss_image
-    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.kernels.ops.diffusion import BitExactFusionGate, tensors_equal
 
     gate = BitExactFusionGate("test norm epilogue")
     if epilogue == "modulate":
@@ -2366,7 +2366,7 @@ def test_moss_image_norm_epilogue_gate_and_graph_replay(monkeypatch, epilogue):
         reference = lambda: (
             norm.forward_native(x) * (1 + scale[:, None]) + shift[:, None]
         )
-    else:
+    elif epilogue == "rope":
         monkeypatch.setattr(moss_image, "_NORM_ROPE_FUSION", gate)
         norm = moss_image._RMSNorm(128).cuda().bfloat16()
         x = torch.randn(1, 33, 3072, device="cuda", dtype=torch.bfloat16)
@@ -2378,13 +2378,32 @@ def test_moss_image_norm_epilogue_gate_and_graph_replay(monkeypatch, epilogue):
         reference = lambda: moss_image._rotate_native(
             norm.forward_native(x.unflatten(-1, (24, 128))), rope
         ).flatten(2)
+    else:
+        monkeypatch.setattr(moss_image, "_QK_NORM_ROPE_FUSION", gate)
+        q_norm = moss_image._RMSNorm(128).cuda().bfloat16()
+        k_norm = moss_image._RMSNorm(128).cuda().bfloat16()
+        nn.init.normal_(q_norm.weight)
+        nn.init.normal_(k_norm.weight)
+        x = torch.randn(1, 33, 3 * 3072, device="cuda", dtype=torch.bfloat16)
+        q, k, _ = x.chunk(3, -1)
+        rope = tuple(
+            torch.randn(1, 33, 128, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        )
+        call = lambda: moss_image._qk_norm_rope(q_norm, k_norm, q, k, rope, 24)
+        reference = lambda: tuple(
+            moss_image._rotate_native(
+                norm.forward_native(value.unflatten(-1, (24, 128))), rope
+            ).flatten(2)
+            for norm, value in ((q_norm, q), (k_norm, k))
+        )
     with torch.no_grad():
         # The unverified graph must capture the existing fallback without a sync.
         cold = torch.cuda.CUDAGraph()
         with torch.cuda.graph(cold):
             cold_out = call()
         assert not gate.verified
-        assert torch.equal(call(), reference())
+        assert tensors_equal(call(), reference())
         assert gate.verified and not gate.disabled
         hot = torch.cuda.CUDAGraph()
         with torch.cuda.graph(hot):
@@ -2394,8 +2413,46 @@ def test_moss_image_norm_epilogue_gate_and_graph_replay(monkeypatch, epilogue):
             cold.replay()
             hot.replay()
             expected = reference()
-            assert torch.equal(cold_out, expected)
-            assert torch.equal(hot_out, expected)
+            assert tensors_equal(cold_out, expected)
+            assert tensors_equal(hot_out, expected)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA PTX")
+@pytest.mark.parametrize("failure", ["mismatch", "exception"])
+@torch.no_grad()
+def test_moss_image_paired_rope_failure_preserves_outputs(monkeypatch, failure):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate, tensors_equal
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    state = BitExactFusionGate("test paired norm epilogue failure")
+    monkeypatch.setattr(moss_image, "_QK_NORM_ROPE_FUSION", state)
+    q_norm = moss_image._RMSNorm(128).cuda().bfloat16()
+    k_norm = moss_image._RMSNorm(128).cuda().bfloat16()
+    q = torch.randn(1, 17, 3072, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    rope = tuple(
+        torch.randn(1, 17, 128, device="cuda", dtype=q.dtype) for _ in range(2)
+    )
+    calls = []
+
+    def incorrect(q, k, *args):
+        calls.append(1)
+        if failure == "exception":
+            raise RuntimeError("injected kernel failure")
+        return torch.full_like(q, float("nan")), torch.full_like(k, float("nan"))
+
+    monkeypatch.setattr(moss_image, "moss_qk_norm_rope_bitexact", incorrect)
+    expected = tuple(
+        moss_image._rotate_native(
+            norm.forward_native(value.unflatten(-1, (24, 128))), rope
+        ).flatten(2)
+        for norm, value in ((q_norm, q), (k_norm, k))
+    )
+    for _ in range(2):
+        assert tensors_equal(
+            moss_image._qk_norm_rope(q_norm, k_norm, q, k, rope, 24), expected
+        )
+    assert state.disabled and not state.verified and len(calls) == 1
 
 
 @pytest.mark.skipif(not is_cuda(), reason="Requires CUDA PTX")

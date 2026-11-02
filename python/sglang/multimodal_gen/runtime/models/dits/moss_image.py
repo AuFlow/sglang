@@ -36,6 +36,9 @@ import msgspec
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.moss_qk_norm_rope import (
+    moss_qk_norm_rope_bitexact,
+)
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_situ_softcap_mul,
@@ -49,6 +52,7 @@ from sglang.kernels.ops.diffusion import (
     rmsnorm_cast_before_weight_bitexact,
     rmsnorm_cast_before_weight_modulate_bitexact,
     rmsnorm_cast_before_weight_rope_bitexact,
+    tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits.moss_image import MOSSImageDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_layer
@@ -77,6 +81,7 @@ _ROPE_FUSION = BitExactFusionGate("MOSSImage RoPE")
 _RMSNORM_FUSION = BitExactFusionGate("MOSSImage RMSNorm", per_signature=True)
 _NORM_MOD_FUSION = BitExactFusionGate("MOSSImage RMSNorm + modulation")
 _NORM_ROPE_FUSION = BitExactFusionGate("MOSSImage RMSNorm + RoPE")
+_QK_NORM_ROPE_FUSION = BitExactFusionGate("MOSSImage paired Q/K RMSNorm + RoPE")
 
 
 def validate_skip_layers(skip_layers, num_layers):
@@ -226,6 +231,35 @@ def _norm_rope(norm, x, rope, heads):
     ).flatten(2)
 
 
+def _qk_norm_rope(q_norm, k_norm, q, k, rope, heads):
+    def reference():
+        return _norm_rope(q_norm, q, rope, heads), _norm_rope(k_norm, k, rope, heads)
+
+    if not can_use_rmsnorm_cast_before_weight_rope(
+        device=q.device,
+        dtype=q.dtype,
+        dim=q.shape[-1] // heads,
+        rows=q.numel() // (q.shape[-1] // heads),
+    ):
+        return reference()
+    sin, cos = (part.flatten(0, 1) for part in rope)
+    q_out, k_out = _QK_NORM_ROPE_FUSION.run(
+        lambda: moss_qk_norm_rope_bitexact(
+            q.unflatten(-1, (heads, -1)),
+            k.unflatten(-1, (heads, -1)),
+            q_norm.weight,
+            k_norm.weight,
+            cos,
+            sin,
+        ),
+        lambda: tuple(x.unflatten(-1, (heads, -1)) for x in reference()),
+        equal=tensors_equal,
+        logger=logger,
+        reraise=(ValueError,),
+    )
+    return q_out.flatten(2), k_out.flatten(2)
+
+
 class _TextBlock(nn.Module):
     def __init__(self, dim, ffn_dim, heads):
         super().__init__()
@@ -311,8 +345,7 @@ class _Block(nn.Module):
                 nn.functional.linear(y, weight)
                 for weight in self.proj["qkv"].weight.chunk(3)
             )
-        q = _norm_rope(self.q_norm, q, rope, self.heads)
-        k = _norm_rope(self.k_norm, k, rope, self.heads)
+        q, k = _qk_norm_rope(self.q_norm, self.k_norm, q, k, rope, self.heads)
         x = residual_gate_add(
             x,
             self.proj["o"](
