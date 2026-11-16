@@ -12,16 +12,16 @@ def _validate_image_size(size: str) -> str:
         width, height = map(int, size.lower().replace(" ", "").split("x"))
     except ValueError as exc:
         raise ValueError("size must be formatted as WIDTHxHEIGHT") from exc
-    if any(value < 1024 or value > 4096 or value % 32 for value in (width, height)):
+    if any(value < 512 or value > 4096 or value % 32 for value in (width, height)):
         raise ValueError(
-            "Image width and height must be between 1024 and 4096 "
+            "Image width and height must be between 512 and 4096 "
             "and multiples of 32"
         )
     return size
 
 
 ImageSize = Annotated[str, AfterValidator(_validate_image_size)]
-ImageDimension = Annotated[int, Field(ge=1024, le=4096, multiple_of=32)]
+ImageDimension = Annotated[int, Field(ge=512, le=4096, multiple_of=32)]
 
 
 # Image API protocol models
