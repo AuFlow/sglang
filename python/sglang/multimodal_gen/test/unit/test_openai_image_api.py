@@ -2,7 +2,9 @@ import inspect
 import os
 from dataclasses import fields
 
-from fastapi import HTTPException
+import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
@@ -15,6 +17,7 @@ from sglang.multimodal_gen.configs.sample.longcat_image import (
     LongCatImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai import image_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
     _common_image_size,
@@ -32,6 +35,56 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageResponse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+
+
+@pytest.fixture
+def image_api_client(monkeypatch):
+    # A 503 marks requests that passed validation and reached the runtime boundary.
+    def no_running_model():
+        raise HTTPException(status_code=503, detail="Test model is unavailable")
+
+    monkeypatch.setattr(image_api, "get_global_server_args", no_running_model)
+    app = FastAPI()
+    app.include_router(image_api.router)
+    with TestClient(app) as client:
+        yield client
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected_status"),
+    [
+        ({}, 503),
+        ({"n": 1}, 503),
+        ({"n": 2}, 422),
+        ({"n": 1, "diffusers_kwargs": {"num_images_per_prompt": 1}}, 503),
+        ({"n": 1, "diffusers_kwargs": {"num_images_per_prompt": 2}}, 422),
+    ],
+)
+def test_generations_restricts_output_count(image_api_client, fields, expected_status):
+    """Both output count fields accept a count of one."""
+    response = image_api_client.post(
+        "/v1/images/generations", json={"prompt": "a lantern", **fields}
+    )
+    assert response.status_code == expected_status, response.text
+
+
+@pytest.mark.parametrize(
+    ("n_values", "expected_status"),
+    [
+        ([], 503),
+        (["1"], 503),
+        (["2"], 422),
+        ([""], 422),
+        (["2", "1"], 422),
+        (["1", "1"], 422),
+    ],
+)
+def test_edits_restricts_output_count(image_api_client, n_values, expected_status):
+    """Multipart edits reject blank and repeated n fields before inference."""
+    parts = [("prompt", (None, "a lantern")), ("image", ("image.png", b"image"))]
+    parts.extend(("n", (None, value)) for value in n_values)
+    response = image_api_client.post("/v1/images/edits", files=parts)
+    assert response.status_code == expected_status, response.text
 
 
 def test_image_edits_declares_perf_dump_path_form_field():

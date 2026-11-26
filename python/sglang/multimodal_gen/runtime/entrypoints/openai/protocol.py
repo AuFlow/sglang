@@ -4,7 +4,7 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
 
 def _validate_image_size(size: str) -> str:
@@ -74,7 +74,7 @@ class ImageGenerationsRequest(BaseModel):
 
     prompt: str
     model: Optional[str] = None
-    n: Optional[int] = 1
+    n: int = Field(default=1, strict=True, ge=1, le=1)
     quality: Optional[str] = "auto"
     response_format: Literal["b64_json"] = "b64_json"
     size: Optional[ImageSize] = "1024x1024"
@@ -109,6 +109,17 @@ class ImageGenerationsRequest(BaseModel):
     progressive_mode: Optional[str] = None
     progressive_levels: Optional[int] = None
     progressive_delta: Optional[float] = None
+
+    @field_validator("diffusers_kwargs")
+    @classmethod
+    def validate_diffusers_output_count(
+        cls, kwargs: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if kwargs is not None and "num_images_per_prompt" in kwargs:
+            count = kwargs["num_images_per_prompt"]
+            if type(count) is not int or count != 1:
+                raise ValueError("diffusers_kwargs.num_images_per_prompt must equal 1")
+        return kwargs
 
 
 # Video API protocol models

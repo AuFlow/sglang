@@ -303,7 +303,7 @@ async def generations(
             size=request.size,
             width=request.width,
             height=request.height,
-            num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
+            num_outputs_per_prompt=request.n,
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
             num_frames=1,
@@ -429,7 +429,7 @@ async def edits(
     prompt: str = Form(...),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
-    n: Optional[int] = Form(1),
+    n: int = Form(1, ge=1, le=1),
     response_format: Literal["b64_json"] = Form("b64_json"),
     size: Optional[ImageSize] = Form(None),
     output_format: Optional[str] = Form(None),
@@ -451,6 +451,13 @@ async def edits(
     perf_dump_path: Optional[str] = Form(None),
     num_frames: int = Form(1),
 ):
+    # Scalar Form parsing treats empty values as missing and keeps only the last value.
+    n_values = (await raw_request.form()).getlist("n")
+    if len(n_values) > 1 or n_values == [""]:
+        raise HTTPException(
+            status_code=422, detail="If provided, n must appear once and equal 1"
+        )
+
     request_id = generate_request_id()
     server_args = get_global_server_args()
     # Resolve images from either `image` or `image[]`.
@@ -492,7 +499,7 @@ async def edits(
             request_id,
             prompt=prompt,
             size=size,
-            num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
+            num_outputs_per_prompt=n,
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
             image_path=input_paths,

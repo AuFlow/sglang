@@ -122,6 +122,9 @@ another model.
 ### Image Generation
 
 The server implements an OpenAI-compatible Images API under the `/v1/images` namespace.
+Image generation and edit requests accept only `n=1` and default to `1` when you omit `n`.
+An invalid `n` returns HTTP `422`, including an empty or repeated `n` in an edit form.
+For image generation, `diffusers_kwargs.num_images_per_prompt` must also be `1` if supplied.
 
 **Create an image**
 
